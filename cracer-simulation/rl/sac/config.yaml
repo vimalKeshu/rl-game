@@ -1,0 +1,57 @@
+# SAC (Soft Actor-Critic) Training Configuration for Cracer Sim
+# SAC is an off-policy algorithm with automatic entropy tuning
+
+# Training duration
+total_timesteps: 1000000
+max_episode_steps: 10000
+
+# SAC Hyperparameters
+learning_rate: 0.0003
+gamma: 0.99
+tau: 0.005  # Soft update coefficient
+alpha: 0.2  # Initial entropy coefficient
+auto_alpha: true  # Automatically tune entropy coefficient
+target_entropy_ratio: 0.98  # Target entropy as ratio of max entropy
+
+# Training
+buffer_size: 100000
+batch_size: 256
+learning_starts: 1000
+train_freq: 1
+gradient_steps: 1
+
+# Network architecture
+hidden_sizes:
+  - 512
+  - 512
+  - 256
+use_layer_norm: true
+
+# Observation normalization
+normalize_obs: true
+obs_clip: 10.0
+
+# Frame stacking
+frame_stack: 1
+
+# Reward shaping
+reward_speed_scale: 0.05
+reward_fuel_bonus: 30.0
+reward_crash_penalty: 50.0
+reward_stage_bonus: 500.0
+reward_survival_bonus: 0.1
+reward_distance_scale: 0.01
+reward_pothole_penalty: 5.0
+
+# Generalization
+randomize_seed: true
+seed_range: 100
+
+# Logging
+log_interval: 1000
+save_interval: 10000
+checkpoint_dir: rl/sac/checkpoints
+
+# Environment
+env_fps: 60
+device: auto
