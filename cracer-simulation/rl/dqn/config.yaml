@@ -1,0 +1,97 @@
+# BALANCED DQN Config - Generalization WITHOUT breaking learning
+# Key insight: normalize_rewards was the problem, NOT random seeds
+
+# Training duration
+total_episodes: 5000
+max_steps_per_episode: 10000
+
+# Replay buffer
+memory_size: 100000
+batch_size: 64
+min_replay_size: 1000
+
+# DQN hyperparameters
+gamma: 0.99
+learning_rate: 0.0001
+lr_decay: 1.0
+lr_min: 0.00001
+
+# Exploration
+eps_start: 1.0
+eps_end: 0.05
+eps_decay: 50000.0
+
+# Target network
+tau: 0.005
+target_update_freq: 1
+
+# Network architecture
+hidden_sizes:
+  - 256
+  - 256
+use_dueling: true
+use_double: true
+use_layer_norm: true
+
+# Prioritized Experience Replay
+use_per: true
+per_alpha: 0.6
+per_beta_start: 0.4
+per_beta_end: 1.0
+per_beta_episodes: 4000
+per_epsilon: 0.000001
+
+# Reward shaping - BALANCED for crash avoidance
+reward_speed_scale: 0.1  # Low - don't let speed dominate
+reward_fuel_bonus: 50.0
+reward_crash_penalty: 100.0  # RAW value - actually hurts now!
+reward_pothole_penalty: 10.0
+reward_bump_penalty: 5.0
+reward_survival_bonus: 0.1
+reward_distance_scale: 0.5
+reward_stage_clear_bonus: 200.0
+
+# Low fuel urgency
+low_fuel_penalty_scale: 1.0
+low_fuel_threshold: 0.3
+
+# Fuel direction guidance
+fuel_direction_scale: 2.0
+
+# Episode termination
+terminate_on_crash: false
+
+# THE FIX: No normalization = crash penalty actually matters
+normalize_rewards: false
+reward_clip: 10.0
+
+# Gradient clipping
+grad_clip_norm: 10.0
+
+# === GENERALIZATION - MODERATE ===
+randomize_seed: true  # YES - for generalization
+seed_range: 100  # Only 100 seeds, not 1 million! Agent sees each ~50 times
+
+# Frame stacking - disabled (simpler)
+frame_stack: 1
+
+# Observation noise - disabled
+obs_noise_std: 0.0
+
+# Dropout - disabled
+dropout_rate: 0.0
+
+# === VISUALIZATION ===
+plot_interval: 100
+save_plots: true
+
+# Checkpointing
+save_every: 100
+save_dir: rl/checkpoints
+log_interval: 10
+
+# Environment
+seed: 42
+device: auto
+resume: ""
+render: false

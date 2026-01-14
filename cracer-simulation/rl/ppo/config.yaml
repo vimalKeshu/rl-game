@@ -1,0 +1,63 @@
+# Improved PPO Training Configuration for Cracer Sim
+# With learning rate annealing, observation normalization, and better reward shaping
+
+# Training duration
+total_timesteps: 1000000
+max_episode_steps: 10000
+
+# PPO Hyperparameters
+learning_rate: 0.0003
+learning_rate_end: 0.00001
+anneal_lr: true
+gamma: 0.99
+gae_lambda: 0.95
+clip_epsilon: 0.2
+value_coef: 0.5
+entropy_coef: 0.05
+entropy_coef_end: 0.005
+anneal_entropy: true
+max_grad_norm: 0.5
+
+# Training
+rollout_steps: 2048
+num_epochs: 10
+batch_size: 64
+
+# Network architecture - larger for better learning
+hidden_sizes:
+  - 512
+  - 512
+  - 256
+use_layer_norm: true
+shared_backbone: false
+
+# Observation normalization
+normalize_obs: true
+obs_clip: 10.0
+
+# Frame stacking
+frame_stack: 1
+
+# Reward shaping - optimized for stage progression
+reward_speed_scale: 0.05
+reward_fuel_bonus: 30.0
+reward_crash_penalty: 50.0
+reward_stage_bonus: 500.0
+reward_survival_bonus: 0.1
+reward_distance_scale: 0.01
+reward_pothole_penalty: 5.0
+reward_near_miss_bonus: 2.0
+
+# Generalization
+randomize_seed: true
+seed_range: 100
+
+# Logging
+log_interval: 1
+save_interval: 10
+checkpoint_dir: rl/ppo/checkpoints
+
+# Environment
+env_fps: 60
+seed: 42
+device: auto
