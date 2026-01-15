@@ -23,7 +23,7 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from cracer_sim import CracerGymEnv  # noqa: E402
+from game import CracerGymEnv  # noqa: E402
 
 
 class FrameStack:

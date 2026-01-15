@@ -12,7 +12,7 @@ A Python implementation inspired by the arcade game Road Fighter: https://en.wik
 Install from the repo root:
 
 ```
-pip install -r cracer_sim/requirements.txt
+pip install -r game/requirements.txt
 ```
 
 Optional RL extras:
@@ -29,7 +29,7 @@ From the repo root:
 python -m cracer_sim.run_human
 ```
 
-Or from `cracer_sim/`:
+Or from `game/`:
 
 ```
 python run_human.py

@@ -7,7 +7,7 @@ This folder contains a simple DQN trainer for the `cracer_sim` Gymnasium wrapper
 You need PyTorch in addition to the root requirements.
 
 ```
-pip install -r cracer_sim/requirements.txt
+pip install -r game/requirements.txt
 pip install -r rl/requirements.txt
 ```
 
