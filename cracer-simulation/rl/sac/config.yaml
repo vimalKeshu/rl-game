@@ -2,26 +2,29 @@
 # SAC is an off-policy algorithm with automatic entropy tuning
 
 # Training duration
-total_timesteps: 1000000
+total_timesteps: 3000000
 max_episode_steps: 10000
 
 # SAC Hyperparameters
 learning_rate: 0.0003
-gamma: 0.99
+gamma: 0.99  # Reduced from 0.995 for faster credit assignment
 tau: 0.005  # Soft update coefficient
 alpha: 0.2  # Initial entropy coefficient
 auto_alpha: true  # Automatically tune entropy coefficient
-target_entropy_ratio: 0.98  # Target entropy as ratio of max entropy
+target_entropy_ratio: 0.5  # Reduced from 0.8 to encourage exploitation
+min_alpha: 0.1  # Minimum alpha to prevent entropy collapse
+grad_clip: 1.0  # Gradient clipping for Q-networks (0 to disable)
 
 # Training
-buffer_size: 100000
+buffer_size: 500000
 batch_size: 256
-learning_starts: 1000
+learning_starts: 20000
 train_freq: 1
-gradient_steps: 1
+gradient_steps: 2
 
 # Network architecture
 hidden_sizes:
+  - 512
   - 512
   - 512
   - 256
@@ -31,26 +34,45 @@ use_layer_norm: true
 normalize_obs: true
 obs_clip: 10.0
 
-# Frame stacking
-frame_stack: 1
+# Frame stacking - increased for temporal context at high speeds
+frame_stack: 4
 
-# Reward shaping
-reward_speed_scale: 0.05
+# Max objects to observe - increased for better lookahead
+max_objects: 10
+
+# Reward shaping - rebalanced for better credit assignment
+reward_speed_scale: 0.1  # Increased to encourage maintaining speed
 reward_fuel_bonus: 30.0
 reward_crash_penalty: 50.0
-reward_stage_bonus: 500.0
-reward_survival_bonus: 0.1
-reward_distance_scale: 0.01
+reward_stage_bonus: 800.0  # Reduced from 500 to reduce reward spikes
+reward_survival_bonus: 0.3  # Increased from 0.1
+reward_distance_scale: 0.05  # Increased 5x for better progress signal
 reward_pothole_penalty: 5.0
+reward_distance_milestone: 50.0  # New: bonus every 500 distance
+reward_distance_milestone_interval: 500  # New: distance between milestones
+reward_safe_speed_bonus: 0.05  # New: bonus for maintaining high speed safely
 
 # Generalization
 randomize_seed: true
-seed_range: 100
+seed_range: 1000  # Increased from 100 for better generalization
+
+# Curriculum Learning - 10-stage curriculum with adaptive mode
+curriculum_enabled: true
+curriculum_graduation_window: 100  # Rolling window for graduation stats
+curriculum_min_episodes_per_stage: 200  # Min episodes before graduation check
+curriculum_adaptive_eval_interval: 50  # Re-compute adaptive weights every N episodes
 
 # Logging
 log_interval: 1000
 save_interval: 10000
 checkpoint_dir: rl/sac/checkpoints
+
+# Evaluation - runs after each checkpoint
+eval_episodes: 10  # Number of episodes for evaluation (0 to disable)
+eval_deterministic: true  # Use deterministic policy during eval
+
+# Early stopping (0 to disable)
+early_stopping_patience: 0  # Stop if no eval improvement for N checkpoints
 
 # Environment
 env_fps: 60

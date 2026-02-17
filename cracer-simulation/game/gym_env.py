@@ -69,8 +69,10 @@ class CracerGymEnv(gym.Env):
         raise ValueError(f"Unknown obs_mode: {obs_mode}")
 
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
-        del options
-        obs, info = self.env.reset(seed=seed)
+        start_stage = 1
+        if options is not None:
+            start_stage = options.get("start_stage", 1)
+        obs, info = self.env.reset(seed=seed, start_stage=start_stage)
         return self._format_obs(obs), info
 
     def step(self, action: Any) -> Tuple[Any, float, bool, bool, dict]:

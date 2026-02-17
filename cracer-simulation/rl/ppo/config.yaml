@@ -9,12 +9,12 @@ max_episode_steps: 10000
 learning_rate: 0.0003
 learning_rate_end: 0.00001
 anneal_lr: true
-gamma: 0.99
-gae_lambda: 0.95
+gamma: 0.995
+gae_lambda: 0.97
 clip_epsilon: 0.2
 value_coef: 0.5
 entropy_coef: 0.05
-entropy_coef_end: 0.005
+entropy_coef_end: 0.01
 anneal_entropy: true
 max_grad_norm: 0.5
 
@@ -36,21 +36,41 @@ normalize_obs: true
 obs_clip: 10.0
 
 # Frame stacking
-frame_stack: 1
+frame_stack: 4
 
 # Reward shaping - optimized for stage progression
 reward_speed_scale: 0.05
 reward_fuel_bonus: 30.0
 reward_crash_penalty: 50.0
-reward_stage_bonus: 500.0
+reward_stage_bonus: 800.0
 reward_survival_bonus: 0.1
-reward_distance_scale: 0.01
+reward_distance_scale: 0.03
+reward_distance_milestone: 50.0  # Bonus every N distance
+reward_distance_milestone_interval: 500
 reward_pothole_penalty: 5.0
 reward_near_miss_bonus: 2.0
 
 # Generalization
 randomize_seed: true
 seed_range: 100
+
+# Curriculum Learning - gradually expose agent to harder stages
+curriculum_enabled: true
+curriculum_warmup_steps: 50000
+curriculum_stage_probs:
+  - 0.30
+  - 0.25
+  - 0.20
+  - 0.25
+curriculum_max_stage: 10
+
+# Evaluation (periodic during training)
+eval_interval_updates: 50
+eval_episodes: 5
+eval_start_stages:
+  - 10
+eval_deterministic: true
+eval_max_episode_steps: 10000
 
 # Logging
 log_interval: 1

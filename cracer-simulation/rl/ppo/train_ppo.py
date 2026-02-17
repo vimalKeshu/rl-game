@@ -86,12 +86,28 @@ class TrainConfig:
     reward_stage_bonus: float = 500.0  # Much higher to incentivize progression
     reward_survival_bonus: float = 0.1  # Small bonus for staying alive
     reward_distance_scale: float = 0.01  # Bonus for distance traveled
+    reward_distance_milestone: float = 50.0  # Bonus every milestone
+    reward_distance_milestone_interval: int = 500  # Distance between milestones
     reward_pothole_penalty: float = 5.0  # Penalty for hitting potholes
     reward_near_miss_bonus: float = 2.0  # Bonus for dodging obstacles
 
     # Generalization
     randomize_seed: bool = True
     seed_range: int = 100
+
+    # Curriculum Learning - start some episodes in later stages
+    curriculum_enabled: bool = True
+    curriculum_warmup_steps: int = 50_000
+    curriculum_stage_probs: Tuple[float, ...] = (0.30, 0.25, 0.20, 0.25)
+    curriculum_max_stage: int = 10
+
+    # Evaluation (periodic during training)
+    eval_interval_updates: int = 50  # Set <= 0 to disable
+    eval_episodes: int = 5  # Episodes per start stage
+    eval_start_stages: Tuple[int, ...] = (10,)
+    eval_deterministic: bool = True
+    eval_max_episode_steps: int = 10_000
+    eval_seed: Optional[int] = None
 
     # Logging
     log_interval: int = 1  # Log every N updates
@@ -109,6 +125,14 @@ class TrainConfig:
             data = yaml.safe_load(f)
         if "hidden_sizes" in data:
             data["hidden_sizes"] = tuple(data["hidden_sizes"])
+        if "curriculum_stage_probs" in data:
+            data["curriculum_stage_probs"] = tuple(data["curriculum_stage_probs"])
+        if "eval_start_stages" in data:
+            raw_stages = data["eval_start_stages"]
+            if isinstance(raw_stages, str):
+                data["eval_start_stages"] = tuple(parse_start_stages(raw_stages))
+            elif isinstance(raw_stages, (list, tuple)):
+                data["eval_start_stages"] = tuple(int(s) for s in raw_stages)
         return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
 
 
@@ -329,7 +353,11 @@ class TrainingLogger:
         self.fieldnames = [
             "update", "timesteps", "episodes", "mean_reward", "mean_score",
             "mean_stage", "mean_length", "policy_loss", "value_loss",
-            "entropy", "learning_rate", "explained_var"
+            "entropy", "learning_rate", "explained_var",
+            "mean_start_stage", "start_stage_t1_frac", "start_stage_t2_frac",
+            "start_stage_t3_frac", "start_stage_t4_frac",
+            "eval_mean_reward", "eval_mean_score", "eval_mean_max_stage",
+            "eval_mean_length", "eval_over_max_rate",
         ]
 
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
@@ -352,6 +380,45 @@ def pick_device(choice: str) -> str:
         return "mps"
     return "cpu"
 
+def load_checkpoint(path: str, device: str):
+    return torch.load(path, map_location=device, weights_only=False)
+
+
+def sample_curriculum_stage(config: TrainConfig, global_step: int) -> int:
+    """Sample a start stage based on curriculum learning settings."""
+    if not config.curriculum_enabled:
+        return 1
+
+    if global_step < config.curriculum_warmup_steps:
+        return 1
+
+    probs = config.curriculum_stage_probs
+    roll = random.random()
+    cumulative = 0.0
+
+    for tier, prob in enumerate(probs):
+        cumulative += prob
+        if roll < cumulative:
+            if tier == 0:
+                return 1
+            if tier == 1:
+                return random.randint(2, 3)
+            if tier == 2:
+                return random.randint(4, 5)
+            return random.randint(6, config.curriculum_max_stage)
+
+    return 1
+
+
+def compute_total_distance(info: dict) -> float:
+    """Compute total distance traveled in current episode."""
+    stage = info.get("stage", 1)
+    distance_remaining = info.get("distance_remaining", 0)
+    stage_distance = 4200 + (stage - 1) * 500
+    completed_stages_distance = sum(4200 + i * 500 for i in range(stage - 1))
+    current_stage_progress = stage_distance - distance_remaining
+    return completed_stages_distance + current_stage_progress
+
 
 def shape_reward(
     reward: float,
@@ -370,16 +437,24 @@ def shape_reward(
     shaped_reward += speed * config.reward_speed_scale * 0.01
 
     # Distance traveled bonus
-    distance_current = info.get("distance", 0)
-    distance_prev = prev_info.get("distance", 0)
-    distance_delta = distance_current - distance_prev
+    total_distance = compute_total_distance(info)
+    prev_total_distance = compute_total_distance(prev_info)
+    distance_delta = total_distance - prev_total_distance
     if distance_delta > 0:
         shaped_reward += distance_delta * config.reward_distance_scale
 
+    # Distance milestone bonus (every N distance units)
+    if config.reward_distance_milestone_interval > 0:
+        prev_milestones = int(prev_total_distance / config.reward_distance_milestone_interval)
+        curr_milestones = int(total_distance / config.reward_distance_milestone_interval)
+        milestones_achieved = curr_milestones - prev_milestones
+        if milestones_achieved > 0:
+            shaped_reward += config.reward_distance_milestone * milestones_achieved
+
     # Fuel pickup bonus
-    fuel_current = info.get("fuel_collected", 0)
-    fuel_prev = prev_info.get("fuel_collected", 0)
-    if fuel_current > fuel_prev:
+    fuel_current = info.get("fuel", 0)
+    fuel_prev = prev_info.get("fuel", 0)
+    if fuel_current > fuel_prev + 5:
         shaped_reward += config.reward_fuel_bonus
 
     # Stage completion bonus - HIGH value to incentivize progression
@@ -397,10 +472,327 @@ def shape_reward(
         shaped_reward -= config.reward_pothole_penalty
 
     # Crash penalty (moderate - don't over-penalize exploration)
-    if info.get("crashed", False):
+    if info.get("game_mode") == "crashed" and prev_info.get("game_mode") == "playing":
         shaped_reward -= config.reward_crash_penalty
 
     return shaped_reward
+
+
+def parse_start_stages(value: str) -> List[int]:
+    if not value:
+        return [1]
+
+    stages: List[int] = []
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start_s, end_s = part.split("-", 1)
+            start = int(start_s)
+            end = int(end_s)
+            step = 1 if end >= start else -1
+            stages.extend(list(range(start, end + step, step)))
+        else:
+            stages.append(int(part))
+
+    # Deduplicate while preserving order
+    seen = set()
+    out: List[int] = []
+    for s in stages:
+        if s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out or [1]
+
+
+def make_video_writer(path: str, fps: float):
+    """Create a video writer for evaluation recording."""
+    try:
+        import imageio.v2 as imageio
+    except ImportError:
+        try:
+            import imageio
+        except ImportError:
+            return None
+
+    try:
+        return imageio.get_writer(path, fps=fps, codec="libx264")
+    except Exception:
+        try:
+            return imageio.get_writer(path, fps=fps)
+        except Exception:
+            return None
+
+
+def build_eval_video_path(num_updates: int, global_step: int) -> str:
+    """Build a unique path for checkpoint evaluation video."""
+    runs_dir = os.path.join(ROOT, "rl", "ppo", "runs")
+    os.makedirs(runs_dir, exist_ok=True)
+
+    base = os.path.join(runs_dir, f"eval_update_{num_updates}_step_{global_step}.mp4")
+    if not os.path.exists(base):
+        return base
+
+    root, ext = os.path.splitext(base)
+    for idx in range(1, 1000):
+        candidate = f"{root}_{idx}{ext}"
+        if not os.path.exists(candidate):
+            return candidate
+    raise RuntimeError("Could not find a free filename for evaluation video")
+
+
+def evaluate_policy(
+    actor_critic: ActorCritic,
+    obs_normalizer: Optional[ObservationNormalizer],
+    config: TrainConfig,
+    start_stages: List[int],
+    episodes: int,
+    deterministic: bool,
+    device: str,
+    eval_seed: Optional[int],
+    max_episode_steps: int,
+    frame_stack: Optional[int] = None,
+    record_video: bool = False,
+    video_path: Optional[str] = None,
+    video_frame_skip: int = 2,
+) -> Tuple[Dict[str, float], List[Dict[str, float]], Optional[str]]:
+    """Evaluate the current policy on specified start stages."""
+    was_training = actor_critic.training
+    actor_critic.eval()
+
+    if record_video and not video_path:
+        raise ValueError("video_path must be provided when record_video=True")
+
+    render_mode = "rgb_array" if record_video else None
+    env = CracerGymEnv(
+        render_mode=render_mode,
+        obs_mode="state",
+        action_mode="discrete",
+        fps=config.env_fps,
+        seed=eval_seed,
+    )
+
+    base_obs_size = env.observation_space.shape[0]
+    fs = frame_stack if frame_stack is not None else config.frame_stack
+    frame_stacker = FrameStack(fs, base_obs_size) if fs > 1 else None
+
+    threshold_stage = config.curriculum_max_stage
+    per_stage_results: List[Dict[str, float]] = []
+    all_rewards: List[float] = []
+    all_scores: List[float] = []
+    all_lengths: List[int] = []
+    all_max_stages: List[int] = []
+    all_over_max = 0
+
+    video_skip = max(1, int(video_frame_skip))
+    video_fps = max(1.0, float(config.env_fps) / video_skip)
+    video_writer = make_video_writer(video_path, video_fps) if record_video and video_path else None
+    saved_video_path = video_path if video_writer is not None else None
+    video_frame_count = 0
+
+    try:
+        for stage_idx, start_stage in enumerate(start_stages):
+            rewards = []
+            scores = []
+            lengths = []
+            max_stages = []
+            over_max = 0
+
+            for ep in range(episodes):
+                if eval_seed is None:
+                    seed = random.randint(0, config.seed_range) if config.randomize_seed else 42
+                else:
+                    seed = eval_seed + stage_idx * episodes + ep
+
+                obs, info = env.reset(seed=seed, options={"start_stage": start_stage})
+                obs = np.asarray(obs, dtype=np.float32)
+                if frame_stacker:
+                    obs = frame_stacker.reset(obs)
+
+                # Record only the first eval episode for each checkpoint.
+                capture_video = video_writer is not None and stage_idx == 0 and ep == 0
+                if capture_video:
+                    frame = env.render()
+                    if frame is not None:
+                        video_writer.append_data(frame)
+                        video_frame_count += 1
+
+                prev_info = info.copy()
+                episode_reward = 0.0
+                episode_length = 0
+                episode_max_stage = info.get("stage", 1)
+
+                done = False
+                while not done and episode_length < max_episode_steps:
+                    obs_in = obs_normalizer.normalize(obs) if obs_normalizer else obs
+                    obs_tensor = torch.tensor(obs_in, dtype=torch.float32, device=device).unsqueeze(0)
+                    with torch.no_grad():
+                        logits, _ = actor_critic(obs_tensor)
+                    if deterministic:
+                        action = int(torch.argmax(logits, dim=1).item())
+                    else:
+                        probs = torch.softmax(logits, dim=1)
+                        action = int(torch.multinomial(probs, 1).item())
+
+                    next_obs, reward, terminated, truncated, info = env.step(action)
+                    next_obs = np.asarray(next_obs, dtype=np.float32)
+
+                    episode_reward += shape_reward(reward, info, prev_info, config)
+                    prev_info = info.copy()
+
+                    episode_length += 1
+                    episode_max_stage = max(episode_max_stage, info.get("stage", 1))
+
+                    if capture_video and episode_length % video_skip == 0:
+                        frame = env.render()
+                        if frame is not None:
+                            video_writer.append_data(frame)
+                            video_frame_count += 1
+
+                    if frame_stacker:
+                        next_obs = frame_stacker.push(next_obs)
+                    obs = next_obs
+
+                    done = terminated or truncated
+
+                rewards.append(episode_reward)
+                scores.append(info.get("score", 0))
+                lengths.append(episode_length)
+                max_stages.append(episode_max_stage)
+                if episode_max_stage > threshold_stage:
+                    over_max += 1
+
+            mean_reward = float(np.mean(rewards)) if rewards else 0.0
+            mean_score = float(np.mean(scores)) if scores else 0.0
+            mean_length = float(np.mean(lengths)) if lengths else 0.0
+            mean_stage = float(np.mean(max_stages)) if max_stages else 0.0
+            over_max_rate = over_max / len(max_stages) if max_stages else 0.0
+
+            per_stage_results.append({
+                "start_stage": float(start_stage),
+                "mean_reward": mean_reward,
+                "mean_score": mean_score,
+                "mean_length": mean_length,
+                "mean_max_stage": mean_stage,
+                "over_max_rate": over_max_rate,
+            })
+
+            all_rewards.extend(rewards)
+            all_scores.extend(scores)
+            all_lengths.extend(lengths)
+            all_max_stages.extend(max_stages)
+            all_over_max += over_max
+    finally:
+        if video_writer is not None:
+            video_writer.close()
+            if video_frame_count == 0:
+                saved_video_path = None
+                if video_path and os.path.exists(video_path):
+                    try:
+                        os.remove(video_path)
+                    except OSError:
+                        pass
+
+    overall: Dict[str, float] = {
+        "mean_reward": float(np.mean(all_rewards)) if all_rewards else 0.0,
+        "mean_score": float(np.mean(all_scores)) if all_scores else 0.0,
+        "mean_length": float(np.mean(all_lengths)) if all_lengths else 0.0,
+        "mean_max_stage": float(np.mean(all_max_stages)) if all_max_stages else 0.0,
+        "over_max_rate": all_over_max / len(all_max_stages) if all_max_stages else 0.0,
+    }
+
+    env.close()
+    if was_training:
+        actor_critic.train()
+
+    return overall, per_stage_results, saved_video_path
+
+
+def evaluate(
+    config: TrainConfig,
+    checkpoint_path: str,
+    episodes: int,
+    start_stages: List[int],
+    deterministic: bool,
+    device_choice: str,
+    eval_seed: Optional[int],
+    max_episode_steps: int,
+) -> None:
+    device = pick_device(device_choice)
+    print(f"Eval device: {device}")
+
+    if not os.path.isabs(checkpoint_path):
+        checkpoint_path = os.path.join(ROOT, checkpoint_path)
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+
+    checkpoint = load_checkpoint(checkpoint_path, device)
+    model_cfg = checkpoint.get("model_config", {})
+
+    hidden_sizes = tuple(model_cfg.get("hidden_sizes", config.hidden_sizes))
+    use_layer_norm = bool(model_cfg.get("use_layer_norm", config.use_layer_norm))
+    shared_backbone = bool(model_cfg.get("shared_backbone", config.shared_backbone))
+    frame_stack = int(model_cfg.get("frame_stack", config.frame_stack))
+    normalize_obs = bool(model_cfg.get("normalize_obs", config.normalize_obs))
+
+    # Create environment
+    env = CracerGymEnv(
+        render_mode=None,
+        obs_mode="state",
+        action_mode="discrete",
+        fps=config.env_fps,
+        seed=eval_seed,
+    )
+
+    base_obs_size = env.observation_space.shape[0]
+    num_actions = env.action_space.n
+    obs_size = base_obs_size * frame_stack
+
+    actor_critic = ActorCritic(
+        obs_size=obs_size,
+        num_actions=num_actions,
+        hidden_sizes=hidden_sizes,
+        use_layer_norm=use_layer_norm,
+        shared_backbone=shared_backbone,
+    ).to(device)
+    actor_critic.load_state_dict(checkpoint["actor_critic"])
+    actor_critic.eval()
+
+    obs_normalizer = ObservationNormalizer(obs_size, config.obs_clip) if normalize_obs else None
+    if obs_normalizer is not None and "obs_normalizer" in checkpoint:
+        obs_normalizer.load_state(checkpoint["obs_normalizer"])
+    env.close()
+
+    print(f"Eval start stages: {start_stages} | Episodes per stage: {episodes}")
+    overall, per_stage, _ = evaluate_policy(
+        actor_critic=actor_critic,
+        obs_normalizer=obs_normalizer,
+        config=config,
+        start_stages=start_stages,
+        episodes=episodes,
+        deterministic=deterministic,
+        device=device,
+        eval_seed=eval_seed,
+        max_episode_steps=max_episode_steps,
+        frame_stack=frame_stack,
+    )
+
+    threshold = config.curriculum_max_stage
+    for row in per_stage:
+        print(
+            f"Start stage {int(row['start_stage'])} | "
+            f"Mean reward: {row['mean_reward']:.1f} | Mean score: {row['mean_score']:.0f} | "
+            f"Mean max stage: {row['mean_max_stage']:.2f} | Mean length: {row['mean_length']:.0f} | "
+            f">%{threshold}: {row['over_max_rate']:.0%}"
+        )
+
+    print(
+        f"Overall | Mean reward: {overall['mean_reward']:.1f} | Mean score: {overall['mean_score']:.0f} | "
+        f"Mean max stage: {overall['mean_max_stage']:.2f} | Mean length: {overall['mean_length']:.0f} | "
+        f">%{threshold}: {overall['over_max_rate']:.0%}"
+    )
 
 
 def train(config: TrainConfig) -> None:
@@ -459,9 +851,11 @@ def train(config: TrainConfig) -> None:
     episode_scores: List[float] = []
     episode_stages: List[int] = []
     episode_lengths: List[int] = []
+    episode_start_stages: List[int] = []
 
     # Current episode state
-    obs, info = env.reset(seed=initial_seed)
+    start_stage = sample_curriculum_stage(config, 0)
+    obs, info = env.reset(seed=initial_seed, options={"start_stage": start_stage})
     obs = np.asarray(obs, dtype=np.float32)
     if frame_stacker:
         obs = frame_stacker.reset(obs)
@@ -469,6 +863,7 @@ def train(config: TrainConfig) -> None:
     current_episode_reward = 0.0
     current_episode_length = 0
     max_stage = 1
+    current_start_stage = start_stage
     prev_info = info.copy()
 
     best_mean_reward = float("-inf")
@@ -528,21 +923,19 @@ def train(config: TrainConfig) -> None:
                 next_obs = frame_stacker.push(next_obs) if not done else next_obs
             obs = next_obs
 
-            # Update observation normalizer statistics
-            if obs_normalizer:
-                obs_normalizer.update(obs)
-
             if done:
                 # Log episode
                 episode_rewards.append(current_episode_reward)
                 episode_scores.append(info.get("score", 0))
                 episode_stages.append(max_stage)
                 episode_lengths.append(current_episode_length)
+                episode_start_stages.append(current_start_stage)
                 episode_count += 1
 
                 # Reset for new episode
                 new_seed = random.randint(0, config.seed_range) if config.randomize_seed else 42
-                obs, info = env.reset(seed=new_seed)
+                start_stage = sample_curriculum_stage(config, global_step)
+                obs, info = env.reset(seed=new_seed, options={"start_stage": start_stage})
                 obs = np.asarray(obs, dtype=np.float32)
                 if frame_stacker:
                     obs = frame_stacker.reset(obs)
@@ -550,7 +943,15 @@ def train(config: TrainConfig) -> None:
                 current_episode_reward = 0.0
                 current_episode_length = 0
                 max_stage = 1
+                current_start_stage = start_stage
                 prev_info = info.copy()
+                # Update observation normalizer with fresh reset obs
+                if obs_normalizer:
+                    obs_normalizer.update(obs)
+            else:
+                # Update observation normalizer with current stacked obs
+                if obs_normalizer:
+                    obs_normalizer.update(obs)
 
             if global_step >= config.total_timesteps:
                 break
@@ -620,17 +1021,116 @@ def train(config: TrainConfig) -> None:
             var_returns = np.var(returns_np)
             explained_var = 1 - np.var(returns_np - values_np) / (var_returns + 1e-8) if var_returns > 0 else 0
 
+        # Save checkpoint and run evaluation after each checkpoint.
+        eval_overall = None
+        checkpoint_due = config.save_interval > 0 and num_updates % config.save_interval == 0
+        if checkpoint_due:
+            checkpoint_name = f"checkpoint_{num_updates}.pt"
+            save_checkpoint(actor_critic, optimizer, config, global_step, num_updates,
+                           checkpoint_dir, checkpoint_name, obs_normalizer)
+
+            if config.eval_episodes > 0:
+                eval_video_path = build_eval_video_path(num_updates, global_step)
+                print(f"\nEval @ checkpoint {checkpoint_name} | start stages: {list(config.eval_start_stages)} | "
+                      f"episodes/stage: {config.eval_episodes}")
+                eval_overall, eval_per_stage, saved_video_path = evaluate_policy(
+                    actor_critic=actor_critic,
+                    obs_normalizer=obs_normalizer,
+                    config=config,
+                    start_stages=list(config.eval_start_stages),
+                    episodes=config.eval_episodes,
+                    deterministic=config.eval_deterministic,
+                    device=device,
+                    eval_seed=config.eval_seed,
+                    max_episode_steps=config.eval_max_episode_steps,
+                    record_video=True,
+                    video_path=eval_video_path,
+                )
+                threshold = config.curriculum_max_stage
+                for row in eval_per_stage:
+                    print(
+                        f"  Start stage {int(row['start_stage'])} | "
+                        f"Mean reward: {row['mean_reward']:.1f} | Mean score: {row['mean_score']:.0f} | "
+                        f"Mean max stage: {row['mean_max_stage']:.2f} | Mean length: {row['mean_length']:.0f} | "
+                        f">%{threshold}: {row['over_max_rate']:.0%}"
+                    )
+                print(
+                    f"  Overall | Mean reward: {eval_overall['mean_reward']:.1f} | "
+                    f"Mean score: {eval_overall['mean_score']:.0f} | "
+                    f"Mean max stage: {eval_overall['mean_max_stage']:.2f} | "
+                    f"Mean length: {eval_overall['mean_length']:.0f} | "
+                    f">%{threshold}: {eval_overall['over_max_rate']:.0%}"
+                )
+                if saved_video_path:
+                    print(f"  Video saved: {saved_video_path}\n")
+                else:
+                    print("  Video saved: failed (imageio writer unavailable)\n")
+        elif (
+            config.eval_episodes > 0
+            and config.eval_interval_updates > 0
+            and num_updates % config.eval_interval_updates == 0
+        ):
+            print(f"\nEval @ update {num_updates} | start stages: {list(config.eval_start_stages)} | "
+                  f"episodes/stage: {config.eval_episodes}")
+            eval_overall, eval_per_stage, _ = evaluate_policy(
+                actor_critic=actor_critic,
+                obs_normalizer=obs_normalizer,
+                config=config,
+                start_stages=list(config.eval_start_stages),
+                episodes=config.eval_episodes,
+                deterministic=config.eval_deterministic,
+                device=device,
+                eval_seed=config.eval_seed,
+                max_episode_steps=config.eval_max_episode_steps,
+                record_video=False,
+            )
+            threshold = config.curriculum_max_stage
+            for row in eval_per_stage:
+                print(
+                    f"  Start stage {int(row['start_stage'])} | "
+                    f"Mean reward: {row['mean_reward']:.1f} | Mean score: {row['mean_score']:.0f} | "
+                    f"Mean max stage: {row['mean_max_stage']:.2f} | Mean length: {row['mean_length']:.0f} | "
+                    f">%{threshold}: {row['over_max_rate']:.0%}"
+                )
+            print(
+                f"  Overall | Mean reward: {eval_overall['mean_reward']:.1f} | "
+                f"Mean score: {eval_overall['mean_score']:.0f} | "
+                f"Mean max stage: {eval_overall['mean_max_stage']:.2f} | "
+                f"Mean length: {eval_overall['mean_length']:.0f} | "
+                f">%{threshold}: {eval_overall['over_max_rate']:.0%}\n"
+            )
+
         # Logging
         if num_updates % config.log_interval == 0 and episode_rewards:
             recent_rewards = episode_rewards[-100:] if len(episode_rewards) >= 100 else episode_rewards
             recent_scores = episode_scores[-100:] if len(episode_scores) >= 100 else episode_scores
             recent_stages = episode_stages[-100:] if len(episode_stages) >= 100 else episode_stages
             recent_lengths = episode_lengths[-100:] if len(episode_lengths) >= 100 else episode_lengths
+            recent_start_stages = (
+                episode_start_stages[-100:] if len(episode_start_stages) >= 100 else episode_start_stages
+            )
 
             mean_reward = np.mean(recent_rewards)
             mean_score = np.mean(recent_scores)
             mean_stage = np.mean(recent_stages)
             mean_length = np.mean(recent_lengths)
+            mean_start_stage = np.mean(recent_start_stages) if recent_start_stages else 1.0
+
+            if recent_start_stages:
+                tier1 = sum(1 for s in recent_start_stages if s == 1)
+                tier2 = sum(1 for s in recent_start_stages if 2 <= s <= 3)
+                tier3 = sum(1 for s in recent_start_stages if 4 <= s <= 5)
+                tier4 = sum(1 for s in recent_start_stages if s >= 6)
+                total = len(recent_start_stages)
+                start_stage_t1_frac = tier1 / total
+                start_stage_t2_frac = tier2 / total
+                start_stage_t3_frac = tier3 / total
+                start_stage_t4_frac = tier4 / total
+            else:
+                start_stage_t1_frac = 1.0
+                start_stage_t2_frac = 0.0
+                start_stage_t3_frac = 0.0
+                start_stage_t4_frac = 0.0
 
             elapsed = time.time() - start_time
             fps = global_step / elapsed
@@ -656,6 +1156,16 @@ def train(config: TrainConfig) -> None:
                 "entropy": np.mean(entropies),
                 "learning_rate": current_lr,
                 "explained_var": explained_var,
+                "mean_start_stage": mean_start_stage,
+                "start_stage_t1_frac": start_stage_t1_frac,
+                "start_stage_t2_frac": start_stage_t2_frac,
+                "start_stage_t3_frac": start_stage_t3_frac,
+                "start_stage_t4_frac": start_stage_t4_frac,
+                "eval_mean_reward": eval_overall["mean_reward"] if eval_overall else "",
+                "eval_mean_score": eval_overall["mean_score"] if eval_overall else "",
+                "eval_mean_max_stage": eval_overall["mean_max_stage"] if eval_overall else "",
+                "eval_mean_length": eval_overall["mean_length"] if eval_overall else "",
+                "eval_over_max_rate": eval_overall["over_max_rate"] if eval_overall else "",
             })
 
             # Save best model
@@ -663,11 +1173,6 @@ def train(config: TrainConfig) -> None:
                 best_mean_reward = mean_reward
                 save_checkpoint(actor_critic, optimizer, config, global_step, num_updates,
                                checkpoint_dir, "best.pt", obs_normalizer)
-
-        # Periodic checkpoint
-        if num_updates % config.save_interval == 0:
-            save_checkpoint(actor_critic, optimizer, config, global_step, num_updates,
-                           checkpoint_dir, f"checkpoint_{num_updates}.pt", obs_normalizer)
 
     # Final save
     save_checkpoint(actor_critic, optimizer, config, global_step, num_updates,
@@ -711,6 +1216,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-epochs", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--eval", action="store_true", help="Run evaluation instead of training")
+    parser.add_argument("--eval-checkpoint", type=str, default="", help="Checkpoint path for evaluation")
+    parser.add_argument("--eval-episodes", type=int, default=5, help="Episodes per start stage")
+    parser.add_argument("--eval-start-stages", type=str, default="10", help="Comma list or ranges (e.g. 8-10,12)")
+    parser.add_argument("--eval-stochastic", action="store_true", help="Use stochastic actions in evaluation")
+    parser.add_argument("--eval-seed", type=int, default=None, help="Base seed for evaluation (None=random)")
+    parser.add_argument("--max-episode-steps", type=int, default=None, help="Cap steps per eval episode")
     return parser.parse_args()
 
 
@@ -741,6 +1253,22 @@ def main() -> None:
         config.batch_size = args.batch_size
     if args.device is not None:
         config.device = args.device
+
+    if args.eval:
+        checkpoint_path = args.eval_checkpoint or os.path.join("rl", "ppo", "checkpoints", "best.pt")
+        start_stages = parse_start_stages(args.eval_start_stages)
+        max_steps = args.max_episode_steps or config.max_episode_steps
+        evaluate(
+            config=config,
+            checkpoint_path=checkpoint_path,
+            episodes=args.eval_episodes,
+            start_stages=start_stages,
+            deterministic=not args.eval_stochastic,
+            device_choice=config.device,
+            eval_seed=args.eval_seed,
+            max_episode_steps=max_steps,
+        )
+        return
 
     train(config)
 

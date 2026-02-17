@@ -159,6 +159,18 @@ def pick_output_path(base: str) -> str:
     raise RuntimeError("Could not find a free filename for output video")
 
 
+def pick_episode_output_path(best_path: str, episode: int) -> str:
+    root, ext = os.path.splitext(best_path)
+    candidate = f"{root}_ep{episode}{ext}"
+    if not os.path.exists(candidate):
+        return candidate
+    for idx in range(1, 1000):
+        fallback = f"{root}_ep{episode}_{idx}{ext}"
+        if not os.path.exists(fallback):
+            return fallback
+    raise RuntimeError("Could not find a free filename for episode output video")
+
+
 def make_writer(path: str, fps: float):
     try:
         import imageio.v2 as imageio
@@ -181,10 +193,11 @@ def resolve_model_config(args, checkpoint) -> dict:
     model_config = checkpoint.get("model_config") if isinstance(checkpoint, dict) else None
 
     config = {
-        "hidden_sizes": (512, 512, 256),
+        "hidden_sizes": (512, 512, 512, 256),
         "use_layer_norm": True,
-        "frame_stack": 1,
-        "normalize_obs": False,
+        "frame_stack": 4,
+        "normalize_obs": True,
+        "max_objects": 10,
     }
 
     if args.hidden_sizes:
@@ -194,8 +207,9 @@ def resolve_model_config(args, checkpoint) -> dict:
 
     if model_config:
         config["use_layer_norm"] = model_config.get("use_layer_norm", True)
-        config["frame_stack"] = model_config.get("frame_stack", 1)
-        config["normalize_obs"] = model_config.get("normalize_obs", False)
+        config["frame_stack"] = model_config.get("frame_stack", 4)
+        config["normalize_obs"] = model_config.get("normalize_obs", True)
+        config["max_objects"] = model_config.get("max_objects", 10)
 
     return config
 
@@ -223,15 +237,7 @@ def main() -> None:
 
     initial_seed = args.seed if args.seed is not None else random.randint(0, 1_000_000)
 
-    env = CracerGymEnv(
-        render_mode=render_mode,
-        obs_mode="state",
-        action_mode="discrete",
-        fps=args.env_fps,
-        seed=initial_seed,
-    )
-    obs, info = env.reset(seed=initial_seed)
-
+    # Load checkpoint first to get model config
     checkpoint_path = args.checkpoint
     if not os.path.isabs(checkpoint_path):
         checkpoint_path = os.path.join(ROOT, checkpoint_path)
@@ -240,12 +246,25 @@ def main() -> None:
     checkpoint = load_checkpoint(checkpoint_path, device)
 
     model_config = resolve_model_config(args, checkpoint)
-    frame_stack_size = model_config.get("frame_stack", 1)
-    normalize_obs = model_config.get("normalize_obs", False)
+    frame_stack_size = model_config.get("frame_stack", 4)
+    normalize_obs = model_config.get("normalize_obs", True)
+    max_objects = model_config.get("max_objects", 10)
 
     print(f"Model config: hidden_sizes={model_config['hidden_sizes']}, "
           f"layer_norm={model_config['use_layer_norm']}, "
-          f"frame_stack={frame_stack_size}, normalize_obs={normalize_obs}")
+          f"frame_stack={frame_stack_size}, normalize_obs={normalize_obs}, "
+          f"max_objects={max_objects}")
+
+    # Create environment with matching config
+    env = CracerGymEnv(
+        render_mode=render_mode,
+        obs_mode="state",
+        action_mode="discrete",
+        fps=args.env_fps,
+        seed=initial_seed,
+        max_objects=max_objects,
+    )
+    obs, info = env.reset(seed=initial_seed)
 
     if "alpha" in checkpoint:
         print(f"Trained alpha (entropy coef): {checkpoint['alpha']:.4f}")
@@ -268,12 +287,13 @@ def main() -> None:
     policy.load_state_dict(checkpoint["policy"])
     policy.eval()
 
-    writer = None
-    output_path = None
-    if not args.no_render and not args.render_live:
-        output_path = pick_output_path(args.output)
+    record_video = not args.no_render and not args.render_live
+    output_path = pick_output_path(args.output) if record_video else None
+    record_fps = None
+    if record_video:
         record_fps = args.record_fps if args.record_fps > 0 else float(args.env_fps) / float(args.frame_skip)
-        writer = make_writer(output_path, record_fps)
+    best_episode_reward = float("-inf")
+    best_episode_idx = None
 
     total_rewards = []
     total_steps = []
@@ -302,6 +322,12 @@ def main() -> None:
         episode_reward = 0.0
         episode_steps = 0
         max_stage = 1
+
+        writer = None
+        episode_output_path = None
+        if record_video:
+            episode_output_path = pick_episode_output_path(output_path, episode)
+            writer = make_writer(episode_output_path, record_fps)
 
         if writer:
             frame = env.render()
@@ -351,8 +377,15 @@ def main() -> None:
         print(f"Episode {episode} (seed={episode_seed}): steps={episode_steps}, reward={episode_reward:.1f}, "
               f"score={final_score:.0f}, stage={max_stage}")
 
-    if writer:
-        writer.close()
+        if writer:
+            writer.close()
+            if episode_reward > best_episode_reward:
+                best_episode_reward = episode_reward
+                best_episode_idx = episode
+                os.replace(episode_output_path, output_path)
+            else:
+                if episode_output_path and os.path.exists(episode_output_path):
+                    os.remove(episode_output_path)
     env.close()
 
     mean_reward = sum(total_rewards) / max(1, len(total_rewards))
@@ -369,7 +402,8 @@ def main() -> None:
     print(f"  Mean stage:  {mean_stage:.1f}")
     print(f"  Max stage:   {max_stage_reached}")
 
-    if output_path:
+    if output_path and best_episode_idx is not None:
+        print(f"  Best episode: {best_episode_idx} (reward={best_episode_reward:.1f})")
         print(f"  Video saved: {output_path}")
 
 

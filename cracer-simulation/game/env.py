@@ -173,7 +173,14 @@ class CracerEnv:
         self.seed_value = seed
         self.rng.seed(seed)
 
-    def reset(self, seed: Optional[int] = None) -> Tuple[Any, Dict[str, Any]]:
+    def reset(self, seed: Optional[int] = None, start_stage: int = 1) -> Tuple[Any, Dict[str, Any]]:
+        """Reset the environment.
+
+        Args:
+            seed: Random seed for reproducibility
+            start_stage: Stage to start at (1-based). Stages > 1 simulate mid-game conditions
+                        with appropriate speed, difficulty, and reduced fuel.
+        """
         if seed is not None:
             self.seed(seed)
 
@@ -182,15 +189,28 @@ class CracerEnv:
         self.hazards = []
         self.lane_markers = []
 
-        self.stage = 1
-        self.score = 0.0
-        self.fuel = self.max_fuel
-        self.lives = Config.starting_lives
-        self.distance_remaining = float(Config.stage_distance)
+        # Clamp start_stage to valid range
+        start_stage = max(1, min(start_stage, 10))
 
-        self.cruise_speed = Config.base_cruise_speed
-        self.max_speed = Config.base_max_speed
+        self.stage = start_stage
+        self.score = 0.0
+        self.lives = Config.starting_lives
+
+        # Calculate stage-adjusted parameters
+        # Each stage increases cruise by 18, max by 22
+        stage_offset = start_stage - 1
+        self.cruise_speed = Config.base_cruise_speed + 18 * stage_offset
+        self.max_speed = Config.base_max_speed + 22 * stage_offset
         self.current_speed = self.cruise_speed
+
+        # Distance for current stage
+        self.distance_remaining = float(Config.stage_distance + stage_offset * 500)
+
+        # Fuel: start with less fuel at higher stages to simulate mid-game pressure
+        # Stage 1: 100%, Stage 2: 85%, Stage 3: 75%, etc.
+        fuel_ratio = max(0.5, 1.0 - 0.15 * stage_offset)
+        self.fuel = self.max_fuel * fuel_ratio
+
         self.speed_zone_offset = 0.0
         self.speed_zone_timer = 0.0
         self.speed_limit = self.cruise_speed
