@@ -1,5 +1,12 @@
 # SAC (Soft Actor-Critic) Training Configuration for Cracer Sim
 # SAC is an off-policy algorithm with automatic entropy tuning
+#
+# AutoResearch Experiment 1b: "Stronger Forward Progress Signal"
+# Hypothesis: Agent plateaus at stage ~2.6 because progress gradient is too
+# weak relative to per-step rewards. Changes: stronger distance rewards,
+# denser milestones, higher crash penalty, larger buffer, more exploitation.
+# Reverted gamma from 0.995 to 0.99 (caused Q-value instability in Exp 1a).
+# Switched to CPU (2.2x faster than MPS for this model size).
 
 # Training duration
 total_timesteps: 3000000
@@ -7,20 +14,20 @@ max_episode_steps: 10000
 
 # SAC Hyperparameters
 learning_rate: 0.0003
-gamma: 0.99  # Reduced from 0.995 for faster credit assignment
+gamma: 0.99  # Kept at 0.99 — 0.995 caused Q-value instability (Q-loss 400-870 oscillations)
 tau: 0.005  # Soft update coefficient
 alpha: 0.2  # Initial entropy coefficient
 auto_alpha: true  # Automatically tune entropy coefficient
-target_entropy_ratio: 0.5  # Reduced from 0.8 to encourage exploitation
-min_alpha: 0.1  # Minimum alpha to prevent entropy collapse
+target_entropy_ratio: 0.4  # Reduced from 0.5 — more exploitation, commit to learned good actions
+min_alpha: 0.05  # Reduced from 0.1 — allow sharper policy when confident
 grad_clip: 1.0  # Gradient clipping for Q-networks (0 to disable)
 
 # Training
-buffer_size: 500000
+buffer_size: 1000000  # Doubled from 500K — retain diverse experience across curriculum stages
 batch_size: 256
 learning_starts: 20000
 train_freq: 1
-gradient_steps: 2
+gradient_steps: 2  # Kept at 2 — 3 was too slow on MPS (~28 FPS vs ~120 FPS)
 
 # Network architecture
 hidden_sizes:
@@ -40,26 +47,26 @@ frame_stack: 4
 # Max objects to observe - increased for better lookahead
 max_objects: 10
 
-# Reward shaping - rebalanced for better credit assignment
-reward_speed_scale: 0.1  # Increased to encourage maintaining speed
+# Reward shaping — AutoResearch Exp 1: strengthen forward-progress signal
+reward_speed_scale: 0.1  # Encourage maintaining speed
 reward_fuel_bonus: 30.0
-reward_crash_penalty: 50.0
-reward_stage_bonus: 800.0  # Reduced from 500 to reduce reward spikes
-reward_survival_bonus: 0.3  # Increased from 0.1
-reward_distance_scale: 0.05  # Increased 5x for better progress signal
+reward_crash_penalty: 75.0  # Increased from 50 — crashes waste distance/fuel, must be punished harder
+reward_stage_bonus: 1000.0  # Increased from 800 — stronger signal for the primary objective
+reward_survival_bonus: 0.15  # Reduced from 0.3 — less incentive to merely survive, more to progress
+reward_distance_scale: 0.1  # Doubled from 0.05 — stronger continuous gradient toward stage completion
 reward_pothole_penalty: 5.0
-reward_distance_milestone: 50.0  # New: bonus every 500 distance
-reward_distance_milestone_interval: 500  # New: distance between milestones
-reward_safe_speed_bonus: 0.05  # New: bonus for maintaining high speed safely
+reward_distance_milestone: 40.0  # Reduced per-milestone from 50 but fires more often (net +33% density)
+reward_distance_milestone_interval: 300  # Reduced from 500 — denser milestone signal every 300 units
+reward_safe_speed_bonus: 0.08  # Increased from 0.05 — reward aggressive but safe driving
 
 # Generalization
 randomize_seed: true
-seed_range: 1000  # Increased from 100 for better generalization
+seed_range: 1000
 
 # Curriculum Learning - 10-stage curriculum with adaptive mode
 curriculum_enabled: true
 curriculum_graduation_window: 100  # Rolling window for graduation stats
-curriculum_min_episodes_per_stage: 200  # Min episodes before graduation check
+curriculum_min_episodes_per_stage: 150  # Reduced from 200 — faster curriculum progression
 curriculum_adaptive_eval_interval: 50  # Re-compute adaptive weights every N episodes
 
 # Logging
@@ -76,4 +83,4 @@ early_stopping_patience: 0  # Stop if no eval improvement for N checkpoints
 
 # Environment
 env_fps: 60
-device: auto
+device: cpu  # CPU is 2.2x faster than MPS for this model size (5382 vs 2413 ops/sec)
