@@ -128,7 +128,7 @@ def load_checkpoint(path: str, device: str):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run inference with a DQN checkpoint and record video")
-    default_checkpoint = os.path.join(ROOT, "rl", "checkpoints", "best.pt")
+    default_checkpoint = os.path.join(ROOT, "rl", "dqn", "checkpoints", "best.pt")
     parser.add_argument("--checkpoint", type=str, default=default_checkpoint)
     parser.add_argument("--output", type=str, default="")
     parser.add_argument("--episodes", type=int, default=1)
@@ -152,7 +152,7 @@ def pick_output_path(base: str) -> str:
             path = os.path.join(ROOT, path)
     else:
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        path = os.path.join(ROOT, "rl", "runs", f"cracer_{timestamp}.mp4")
+        path = os.path.join(ROOT, "rl", "dqn", "runs", f"dqn_{timestamp}.mp4")
 
     base_dir = os.path.dirname(path)
     if base_dir:
@@ -186,16 +186,38 @@ def make_writer(path: str, fps: float):
         )
 
 
+class ObservationNormalizer:
+    """Running mean/std normalization for observations (inference mode)."""
+    def __init__(self, obs_size: int, clip: float = 10.0, epsilon: float = 1e-8):
+        self.obs_size = obs_size
+        self.clip = clip
+        self.epsilon = epsilon
+        self.mean = np.zeros(obs_size, dtype=np.float64)
+        self.var = np.ones(obs_size, dtype=np.float64)
+        self.count = 0
+
+    def normalize(self, obs: np.ndarray) -> np.ndarray:
+        normalized = (obs - self.mean.astype(np.float32)) / (np.sqrt(self.var.astype(np.float32)) + self.epsilon)
+        return np.clip(normalized, -self.clip, self.clip)
+
+    def load_state(self, state: dict):
+        self.mean = state["mean"]
+        self.var = state["var"]
+        self.count = state["count"]
+
+
 def resolve_model_config(args, checkpoint) -> dict:
     """Extract model configuration from checkpoint or use defaults."""
     model_config = checkpoint.get("model_config") if isinstance(checkpoint, dict) else None
 
     config = {
-        "hidden_sizes": (256, 256),
-        "use_dueling": False,
-        "use_layer_norm": False,
-        "frame_stack": 1,
-        "dropout_rate": 0.1,  # Default matches training config
+        "hidden_sizes": (512, 512, 256),
+        "use_dueling": True,
+        "use_layer_norm": True,
+        "frame_stack": 4,
+        "dropout_rate": 0.0,
+        "normalize_obs": True,
+        "max_objects": 10,
     }
 
     if args.hidden_sizes:
@@ -204,10 +226,12 @@ def resolve_model_config(args, checkpoint) -> dict:
         config["hidden_sizes"] = tuple(model_config["hidden_sizes"])
 
     if model_config:
-        config["use_dueling"] = model_config.get("use_dueling", False)
-        config["use_layer_norm"] = model_config.get("use_layer_norm", False)
-        config["frame_stack"] = model_config.get("frame_stack", 1)
+        config["use_dueling"] = model_config.get("use_dueling", True)
+        config["use_layer_norm"] = model_config.get("use_layer_norm", True)
+        config["frame_stack"] = model_config.get("frame_stack", 4)
         config["dropout_rate"] = model_config.get("dropout_rate", 0.0)
+        config["normalize_obs"] = model_config.get("normalize_obs", True)
+        config["max_objects"] = model_config.get("max_objects", 10)
 
     return config
 
@@ -239,15 +263,7 @@ def main() -> None:
 
     initial_seed = args.seed if args.seed is not None else random.randint(0, 1_000_000)
 
-    env = CracerGymEnv(
-        render_mode=render_mode,
-        obs_mode="state",
-        action_mode="discrete",
-        fps=args.env_fps,
-        seed=initial_seed,
-    )
-    obs, info = env.reset(seed=initial_seed)
-
+    # Load checkpoint first to get model config
     checkpoint_path = args.checkpoint
     if not os.path.isabs(checkpoint_path):
         checkpoint_path = os.path.join(ROOT, checkpoint_path)
@@ -256,11 +272,23 @@ def main() -> None:
     checkpoint = load_checkpoint(checkpoint_path, device)
 
     model_config = resolve_model_config(args, checkpoint)
-    frame_stack_size = model_config.get("frame_stack", 1)
+    frame_stack_size = model_config.get("frame_stack", 4)
+    normalize_obs = model_config.get("normalize_obs", True)
+    max_objects = model_config.get("max_objects", 10)
 
     print(f"Model config: hidden_sizes={model_config['hidden_sizes']}, "
           f"dueling={model_config['use_dueling']}, layer_norm={model_config['use_layer_norm']}, "
-          f"frame_stack={frame_stack_size}")
+          f"frame_stack={frame_stack_size}, normalize_obs={normalize_obs}, max_objects={max_objects}")
+
+    env = CracerGymEnv(
+        render_mode=render_mode,
+        obs_mode="state",
+        action_mode="discrete",
+        fps=args.env_fps,
+        seed=initial_seed,
+        max_objects=max_objects,
+    )
+    obs, info = env.reset(seed=initial_seed)
 
     base_obs_size = env.observation_space.shape[0]
     num_actions = env.action_space.n
@@ -268,6 +296,13 @@ def main() -> None:
 
     # Frame stacker
     frame_stacker = FrameStack(frame_stack_size, base_obs_size) if frame_stack_size > 1 else None
+
+    # Observation normalizer
+    obs_normalizer = None
+    if normalize_obs and "obs_normalizer" in checkpoint:
+        obs_normalizer = ObservationNormalizer(obs_size)
+        obs_normalizer.load_state(checkpoint["obs_normalizer"])
+        print(f"Loaded observation normalizer (trained on {obs_normalizer.count} samples)")
 
     q_net = create_network(obs_size, num_actions, model_config, device)
     q_net.load_state_dict(checkpoint["q_net"])
@@ -311,8 +346,9 @@ def main() -> None:
                 writer.append_data(frame)
 
         while episode_steps < args.max_episode_steps:
+            obs_for_net = obs_normalizer.normalize(stacked_obs) if obs_normalizer else stacked_obs
             with torch.no_grad():
-                obs_tensor = torch.tensor(stacked_obs, dtype=torch.float32, device=device).unsqueeze(0)
+                obs_tensor = torch.tensor(obs_for_net, dtype=torch.float32, device=device).unsqueeze(0)
                 q_values = q_net(obs_tensor)
                 action = int(torch.argmax(q_values, dim=1).item())
 

@@ -108,7 +108,8 @@ class TrainConfig:
     checkpoint_dir: str = "rl/sac/checkpoints"
 
     # Evaluation
-    eval_episodes: int = 10  # Number of episodes to run for evaluation
+    eval_episodes: int = 5   # Episodes per start stage
+    eval_start_stages: Tuple[int, ...] = (1, 3, 5)  # Start stages to evaluate from
     eval_deterministic: bool = True  # Use deterministic policy during eval
 
     # Early stopping
@@ -125,6 +126,8 @@ class TrainConfig:
             data = yaml.safe_load(f)
         if "hidden_sizes" in data:
             data["hidden_sizes"] = tuple(data["hidden_sizes"])
+        if "eval_start_stages" in data:
+            data["eval_start_stages"] = tuple(int(s) for s in data["eval_start_stages"])
         return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
 
 
@@ -298,7 +301,12 @@ class TrainingLogger:
         self.log_path = log_path
         self.fieldnames = [
             "timestep", "episodes", "mean_reward", "mean_score", "mean_stage",
-            "mean_length", "q1_loss", "q2_loss", "policy_loss", "alpha", "entropy"
+            "mean_length", "q1_loss", "q2_loss", "policy_loss", "alpha", "entropy",
+            # Per-stage eval columns (stage 1 is the primary generalization metric)
+            "eval_stage1_mean_stage", "eval_stage1_mean_reward",
+            "eval_stage3_mean_stage", "eval_stage3_mean_reward",
+            "eval_stage5_mean_stage", "eval_stage5_mean_reward",
+            "eval_overall_mean_stage", "eval_overall_mean_reward",
         ]
 
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
@@ -309,7 +317,7 @@ class TrainingLogger:
     def log(self, metrics: Dict):
         with open(self.log_path, "a", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=self.fieldnames)
-            writer.writerow({k: metrics.get(k, 0) for k in self.fieldnames})
+            writer.writerow({k: metrics.get(k, "") for k in self.fieldnames})
 
 
 def pick_device(choice: str) -> str:
@@ -439,8 +447,13 @@ class CurriculumManager:
         max_r = max(max_r, 1.0)
         raw = {s: 1.0 / (means[s] / max_r + 0.1) for s in range(1, 11)}
         total = sum(raw.values())
-        self.adaptive_weights = {s: max(raw[s] / total, 0.05) for s in range(1, 11)}
-        # Renormalize after floor
+        # Stage 1 gets a hard floor of 0.20 — agent must never forget how to play
+        # from the beginning, which is what eval measures.
+        self.adaptive_weights = {
+            s: max(raw[s] / total, 0.20 if s == 1 else 0.05)
+            for s in range(1, 11)
+        }
+        # Renormalize after floors
         total2 = sum(self.adaptive_weights.values())
         self.adaptive_weights = {s: w / total2 for s, w in self.adaptive_weights.items()}
         print(f"ADAPTIVE weights: { {s: f'{w:.3f}' for s, w in self.adaptive_weights.items()} }")
@@ -578,136 +591,131 @@ def evaluate(
     config: TrainConfig,
     obs_normalizer: Optional[ObservationNormalizer],
     device: str,
-    num_episodes: int = 10,
+    num_episodes: int = 5,
     deterministic: bool = True,
     global_step: int = 0,
     record_video: bool = True,
     video_dir: Optional[str] = None,
+    start_stages: Optional[Tuple[int, ...]] = None,
 ) -> Dict[str, float]:
-    """Run evaluation episodes and return metrics.
+    """Run evaluation episodes across multiple start stages and return metrics.
 
-    Args:
-        policy: Policy network to evaluate
-        config: Training configuration
-        obs_normalizer: Observation normalizer (can be None)
-        device: Device to run on
-        num_episodes: Number of episodes to run
-        deterministic: If True, use argmax action; if False, sample
-        global_step: Current training step (for video filename)
-        record_video: Whether to record video of best episode
-        video_dir: Directory to save videos (defaults to rl/sac/runs)
+    Runs `num_episodes` per start stage. Stage 1 performance is the primary
+    generalization metric — it measures whether the agent can progress from
+    the very beginning, independent of curriculum start distribution.
 
-    Returns:
-        Dictionary with mean_reward, mean_score, mean_stage, mean_length
+    Returns per-stage metrics plus overall aggregated metrics.
     """
-    # Determine if we can record video
-    render_mode = "rgb_array" if record_video else None
+    if start_stages is None:
+        start_stages = config.eval_start_stages
 
-    # Create a separate eval environment
+    render_mode = "rgb_array" if record_video else None
     eval_env = CracerGymEnv(
         render_mode=render_mode,
         obs_mode="state",
         action_mode="discrete",
         fps=config.env_fps,
-        seed=42,  # Fixed seed for reproducibility
+        seed=42,
         max_objects=config.max_objects,
     )
 
     base_obs_size = eval_env.observation_space.shape[0]
     frame_stacker = FrameStack(config.frame_stack, base_obs_size) if config.frame_stack > 1 else None
 
-    episode_rewards = []
-    episode_scores = []
-    episode_stages = []
-    episode_lengths = []
-
-    # Video recording setup
     if video_dir is None:
         video_dir = os.path.join(ROOT, "rl", "sac", "runs")
     os.makedirs(video_dir, exist_ok=True)
 
-    best_episode_reward = float("-inf")
-    best_episode_frames: List[np.ndarray] = []
-    record_fps = config.env_fps // 2  # Record at half fps to reduce file size
-
+    record_fps = config.env_fps // 2
     policy.eval()
 
-    for ep in range(num_episodes):
-        obs, info = eval_env.reset(seed=42 + ep)
-        obs = np.asarray(obs, dtype=np.float32)
-        if frame_stacker:
-            obs = frame_stacker.reset(obs)
+    # Per-start-stage results
+    per_stage_results: Dict[int, Dict[str, float]] = {}
+    all_rewards: List[float] = []
+    all_stages: List[float] = []
 
-        episode_reward = 0.0
-        episode_length = 0
-        max_stage = 1
-        prev_info = info.copy()
-        episode_state: Dict[str, Any] = {}
-        done = False
-        episode_frames: List[np.ndarray] = []
+    best_episode_reward = float("-inf")
+    best_episode_frames: List[np.ndarray] = []
 
-        # Capture initial frame
-        if record_video and render_mode == "rgb_array":
-            frame = eval_env.render()
-            if frame is not None:
-                episode_frames.append(frame)
+    for start_stage in start_stages:
+        stage_rewards = []
+        stage_scores = []
+        stage_max_stages = []
+        stage_lengths = []
 
-        while not done and episode_length < config.max_episode_steps:
-            # Normalize observation
-            if obs_normalizer:
-                obs_normalized = obs_normalizer.normalize(obs)
-            else:
-                obs_normalized = obs
+        for ep in range(num_episodes):
+            # Use different seeds per stage+episode for diversity
+            seed = 100 + start_stage * 100 + ep
+            obs, info = eval_env.reset(seed=seed, options={"start_stage": start_stage})
+            obs = np.asarray(obs, dtype=np.float32)
+            if frame_stacker:
+                obs = frame_stacker.reset(obs)
 
-            # Select action
-            with torch.no_grad():
-                obs_tensor = torch.tensor(obs_normalized, dtype=torch.float32, device=device).unsqueeze(0)
-                if deterministic:
-                    # Use argmax for deterministic action
-                    logits = policy(obs_tensor)
-                    action = logits.argmax(dim=-1).item()
-                else:
-                    action, _, _ = policy.sample_action(obs_tensor)
-
-            # Step environment
-            next_obs, reward, terminated, truncated, info = eval_env.step(action)
-            next_obs = np.asarray(next_obs, dtype=np.float32)
-
-            # Shape reward (same as training for fair comparison)
-            shaped_reward = shape_reward(reward, info, prev_info, config, episode_state)
+            episode_reward = 0.0
+            episode_length = 0
+            max_stage = start_stage
             prev_info = info.copy()
+            episode_state: Dict[str, Any] = {}
+            done = False
+            episode_frames: List[np.ndarray] = []
 
-            episode_reward += shaped_reward
-            episode_length += 1
-            max_stage = max(max_stage, info.get("stage", 1))
-
-            done = terminated or truncated
-
-            # Capture frame every 2 steps to reduce video size
-            if record_video and render_mode == "rgb_array" and episode_length % 2 == 0:
+            if record_video and render_mode == "rgb_array":
                 frame = eval_env.render()
                 if frame is not None:
                     episode_frames.append(frame)
 
-            if frame_stacker:
-                obs = frame_stacker.push(next_obs)
-            else:
-                obs = next_obs
+            while not done and episode_length < config.max_episode_steps:
+                obs_normalized = obs_normalizer.normalize(obs) if obs_normalizer else obs
+                with torch.no_grad():
+                    obs_tensor = torch.tensor(obs_normalized, dtype=torch.float32, device=device).unsqueeze(0)
+                    if deterministic:
+                        action = policy(obs_tensor).argmax(dim=-1).item()
+                    else:
+                        action, _, _ = policy.sample_action(obs_tensor)
 
-        episode_rewards.append(episode_reward)
-        episode_scores.append(info.get("score", 0))
-        episode_stages.append(max_stage)
-        episode_lengths.append(episode_length)
+                next_obs, reward, terminated, truncated, info = eval_env.step(action)
+                next_obs = np.asarray(next_obs, dtype=np.float32)
 
-        # Keep frames from best episode
-        if episode_reward > best_episode_reward:
-            best_episode_reward = episode_reward
-            best_episode_frames = episode_frames
+                shaped_reward = shape_reward(reward, info, prev_info, config, episode_state)
+                prev_info = info.copy()
+
+                episode_reward += shaped_reward
+                episode_length += 1
+                max_stage = max(max_stage, info.get("stage", 1))
+                done = terminated or truncated
+
+                if record_video and render_mode == "rgb_array" and episode_length % 2 == 0:
+                    frame = eval_env.render()
+                    if frame is not None:
+                        episode_frames.append(frame)
+
+                if frame_stacker:
+                    obs = frame_stacker.push(next_obs)
+                else:
+                    obs = next_obs
+
+            stage_rewards.append(episode_reward)
+            stage_scores.append(info.get("score", 0))
+            stage_max_stages.append(max_stage)
+            stage_lengths.append(episode_length)
+
+            if episode_reward > best_episode_reward:
+                best_episode_reward = episode_reward
+                best_episode_frames = episode_frames
+
+        per_stage_results[start_stage] = {
+            "mean_reward": float(np.mean(stage_rewards)),
+            "mean_score": float(np.mean(stage_scores)),
+            "mean_stage": float(np.mean(stage_max_stages)),
+            "mean_length": float(np.mean(stage_lengths)),
+        }
+        all_rewards.extend(stage_rewards)
+        all_stages.extend(stage_max_stages)
 
     eval_env.close()
     policy.train()
 
-    # Save video of best episode
+    # Save video of best episode across all stages
     video_path = None
     if record_video and best_episode_frames:
         video_filename = f"eval_step_{global_step}.mp4"
@@ -718,21 +726,56 @@ def evaluate(
                 writer.append_data(frame)
             writer.close()
         else:
-            video_path = None  # Failed to create writer
+            video_path = None
 
-    return {
-        "eval_mean_reward": float(np.mean(episode_rewards)),
-        "eval_std_reward": float(np.std(episode_rewards)),
-        "eval_mean_score": float(np.mean(episode_scores)),
-        "eval_mean_stage": float(np.mean(episode_stages)),
-        "eval_mean_length": float(np.mean(episode_lengths)),
-        "eval_min_reward": float(np.min(episode_rewards)),
-        "eval_max_reward": float(np.max(episode_rewards)),
+    result = {
+        "eval_overall_mean_reward": float(np.mean(all_rewards)),
+        "eval_overall_mean_stage": float(np.mean(all_stages)),
         "eval_video_path": video_path,
     }
+    # Add per-stage keys
+    for stage, metrics in per_stage_results.items():
+        result[f"eval_stage{stage}_mean_stage"] = metrics["mean_stage"]
+        result[f"eval_stage{stage}_mean_reward"] = metrics["mean_reward"]
+        result[f"eval_stage{stage}_mean_score"] = metrics["mean_score"]
+        result[f"eval_stage{stage}_mean_length"] = metrics["mean_length"]
+
+    return result
 
 
-def train(config: TrainConfig, resume: bool = True) -> None:
+def warm_start_policy(policy: nn.Module,
+                      obs_normalizer: Optional[ObservationNormalizer],
+                      checkpoint_path: str,
+                      device: str) -> None:
+    """Load ONLY the policy (actor) weights from a checkpoint.
+
+    Q-networks, optimizers, alpha, and curriculum are intentionally NOT loaded —
+    they must be recalibrated from scratch under the new training distribution.
+    The obs_normalizer is optionally loaded since the observation space is unchanged.
+    """
+    if not os.path.isabs(checkpoint_path):
+        checkpoint_path = os.path.join(ROOT, checkpoint_path)
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Warm-start checkpoint not found: {checkpoint_path}")
+
+    print(f"\nWarm-starting policy from: {checkpoint_path}")
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+
+    # Load policy weights only
+    policy.load_state_dict(ckpt["policy"])
+    print("  Policy weights loaded.")
+
+    # Optionally load obs_normalizer (same obs space, statistics still valid)
+    if obs_normalizer is not None and "obs_normalizer" in ckpt:
+        obs_normalizer.load_state(ckpt["obs_normalizer"])
+        print(f"  Obs normalizer loaded (trained on {obs_normalizer.count} samples).")
+
+    step = ckpt.get("global_step", "?")
+    print(f"  Source checkpoint was at step {step}.")
+    print("  Q-networks, optimizers, alpha, curriculum: initialized fresh.\n")
+
+
+def train(config: TrainConfig, resume: bool = True, warm_start_path: str = "") -> None:
     """Main SAC training loop.
 
     Args:
@@ -866,7 +909,23 @@ def train(config: TrainConfig, resume: bool = True) -> None:
     else:
         print("\nStarting fresh training (--no-resume specified)")
 
+    # Warm-start: load only policy weights from a prior experiment's checkpoint
+    if warm_start_path:
+        warm_start_policy(policy, obs_normalizer, warm_start_path, device)
+
     logger = TrainingLogger(os.path.join(checkpoint_dir, "training_log.csv"))
+
+    # Separate eval log — primary generalization record
+    # Always recreate on fresh run; append when resuming
+    eval_log_path = os.path.join(checkpoint_dir, "eval_log.csv")
+    eval_log_fields = ["timestep", "episodes"] + [
+        f"stage{s}_{m}" for s in config.eval_start_stages for m in ("mean_stage", "mean_reward", "mean_score")
+    ] + ["overall_mean_stage", "overall_mean_reward"]
+    eval_log_exists = os.path.exists(eval_log_path)
+    if not resume or not eval_log_exists:
+        with open(eval_log_path, "w", newline="") as f:
+            csv.DictWriter(f, fieldnames=eval_log_fields).writeheader()
+
     episode_rewards: List[float] = []
     episode_scores: List[float] = []
     episode_stages: List[int] = []
@@ -1105,6 +1164,7 @@ def train(config: TrainConfig, resume: bool = True) -> None:
                 "alpha": alpha,
                 "entropy": np.mean(entropies[-100:]) if entropies else 0,
             })
+            # Note: eval metrics are logged separately when eval runs (at save_interval)
 
             # Save best model
             if mean_reward > best_mean_reward:
@@ -1123,33 +1183,50 @@ def train(config: TrainConfig, resume: bool = True) -> None:
 
             # Run evaluation
             if config.eval_episodes > 0:
-                print(f"\n  Running evaluation ({config.eval_episodes} episodes)...")
+                stages_str = str(list(config.eval_start_stages))
+                print(f"\n  Running evaluation ({config.eval_episodes} ep × {stages_str} start stages)...")
                 eval_metrics = evaluate(
                     policy, config, obs_normalizer, device,
                     num_episodes=config.eval_episodes,
                     deterministic=config.eval_deterministic,
                     global_step=global_step,
                     record_video=True,
+                    start_stages=config.eval_start_stages,
                 )
-                print(f"  Eval reward: {eval_metrics['eval_mean_reward']:.1f} ± {eval_metrics['eval_std_reward']:.1f}")
-                print(f"  Eval score: {eval_metrics['eval_mean_score']:.0f} | "
-                      f"Stage: {eval_metrics['eval_mean_stage']:.1f} | "
-                      f"Length: {eval_metrics['eval_mean_length']:.0f}")
-                print(f"  Eval range: [{eval_metrics['eval_min_reward']:.0f}, {eval_metrics['eval_max_reward']:.0f}]")
+
+                # Print per-stage breakdown — stage 1 is the generalization metric
+                for ss in config.eval_start_stages:
+                    ms = eval_metrics.get(f"eval_stage{ss}_mean_stage", 0)
+                    mr = eval_metrics.get(f"eval_stage{ss}_mean_reward", 0)
+                    print(f"  Start stage {ss}: mean_stage={ms:.2f}  mean_reward={mr:.0f}")
+                print(f"  Overall:       mean_stage={eval_metrics['eval_overall_mean_stage']:.2f}  "
+                      f"mean_reward={eval_metrics['eval_overall_mean_reward']:.0f}")
                 if eval_metrics.get('eval_video_path'):
                     print(f"  Video saved: {eval_metrics['eval_video_path']}")
                 print()
 
-                # Track best eval and early stopping
-                if eval_metrics['eval_mean_reward'] > best_eval_reward:
-                    best_eval_reward = eval_metrics['eval_mean_reward']
+                # Log eval metrics to dedicated CSV
+                eval_row = {"timestep": global_step, "episodes": episode_count}
+                for ss in config.eval_start_stages:
+                    eval_row[f"stage{ss}_mean_stage"] = eval_metrics.get(f"eval_stage{ss}_mean_stage", "")
+                    eval_row[f"stage{ss}_mean_reward"] = eval_metrics.get(f"eval_stage{ss}_mean_reward", "")
+                    eval_row[f"stage{ss}_mean_score"] = eval_metrics.get(f"eval_stage{ss}_mean_score", "")
+                eval_row["overall_mean_stage"] = eval_metrics["eval_overall_mean_stage"]
+                eval_row["overall_mean_reward"] = eval_metrics["eval_overall_mean_reward"]
+                with open(eval_log_path, "a", newline="") as f:
+                    csv.DictWriter(f, fieldnames=eval_log_fields).writerow(eval_row)
+
+                # Primary generalization metric = stage-1 eval mean_stage
+                primary_metric = eval_metrics.get("eval_stage1_mean_stage", eval_metrics["eval_overall_mean_stage"])
+
+                if primary_metric > best_eval_reward:
+                    best_eval_reward = primary_metric
                     evals_without_improvement = 0
-                    # Save best eval checkpoint
                     save_checkpoint(policy, q1, q2, config, global_step, episode_count,
                                    checkpoint_dir, "best_eval.pt", obs_normalizer, alpha,
                                    q1_target, q2_target, policy_optimizer, q1_optimizer,
                                    q2_optimizer, alpha_optimizer, log_alpha, curriculum)
-                    print(f"  New best eval reward: {best_eval_reward:.1f} - saved best_eval.pt")
+                    print(f"  New best (stage1 eval_stage={best_eval_reward:.2f}) - saved best_eval.pt")
                 else:
                     evals_without_improvement += 1
                     if config.early_stopping_patience > 0:
@@ -1258,6 +1335,10 @@ def parse_args() -> argparse.Namespace:
                        help="Resume from latest checkpoint (default)")
     parser.add_argument("--no-resume", dest="resume", action="store_false",
                        help="Start fresh training, ignore existing checkpoints")
+    parser.add_argument("--warm-start-policy", type=str, default="",
+                       help="Path to checkpoint — loads ONLY policy weights, resets Q-nets "
+                            "and optimizers. Use to transfer navigation knowledge across "
+                            "experiments without inheriting miscalibrated critics.")
     return parser.parse_args()
 
 
@@ -1287,7 +1368,7 @@ def main() -> None:
     if args.device is not None:
         config.device = args.device
 
-    train(config, resume=args.resume)
+    train(config, resume=args.resume, warm_start_path=args.warm_start_policy)
 
 
 if __name__ == "__main__":

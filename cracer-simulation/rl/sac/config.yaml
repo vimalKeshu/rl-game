@@ -1,35 +1,37 @@
-# SAC (Soft Actor-Critic) Training Configuration for Cracer Sim
-# SAC is an off-policy algorithm with automatic entropy tuning
+# SAC Training Configuration — Experiment 5
 #
-# AutoResearch Experiment 1b: "Stronger Forward Progress Signal"
-# Hypothesis: Agent plateaus at stage ~2.6 because progress gradient is too
-# weak relative to per-step rewards. Changes: stronger distance rewards,
-# denser milestones, higher crash penalty, larger buffer, more exploitation.
-# Reverted gamma from 0.995 to 0.99 (caused Q-value instability in Exp 1a).
-# Switched to CPU (2.2x faster than MPS for this model size).
+# Root cause of all previous failures: curriculum started episodes at stages 4-6,
+# training distribution drifted away from stage 1, generalization collapsed.
+#
+# Fix: disable curriculum entirely. Every episode starts at stage 1.
+# The agent can only improve in training by ACTUALLY CLEARING stages.
+# training mean_stage = eval mean_stage — no more lying metrics.
+#
+# Warm-start: load policy weights from Exp 4 best_eval.pt so the agent already
+# knows basic navigation. Q-networks reset fresh to recalibrate under new distribution.
 
 # Training duration
 total_timesteps: 3000000
 max_episode_steps: 10000
 
-# SAC Hyperparameters
+# SAC Hyperparameters — same as Exp 4 (validated)
 learning_rate: 0.0003
-gamma: 0.99  # Kept at 0.99 — 0.995 caused Q-value instability (Q-loss 400-870 oscillations)
-tau: 0.005  # Soft update coefficient
-alpha: 0.2  # Initial entropy coefficient
-auto_alpha: true  # Automatically tune entropy coefficient
-target_entropy_ratio: 0.4  # Reduced from 0.5 — more exploitation, commit to learned good actions
-min_alpha: 0.05  # Reduced from 0.1 — allow sharper policy when confident
-grad_clip: 1.0  # Gradient clipping for Q-networks (0 to disable)
+gamma: 0.99
+tau: 0.005
+alpha: 0.2
+auto_alpha: true
+target_entropy_ratio: 0.25  # Validated in Exp 4 — alpha converges to ~0.52
+min_alpha: 0.05
+grad_clip: 1.0
 
-# Training
-buffer_size: 1000000  # Doubled from 500K — retain diverse experience across curriculum stages
+# Training — same as Exp 4
+buffer_size: 500000
 batch_size: 256
-learning_starts: 20000
+learning_starts: 5000   # Lower than before — policy already warm-started, learns faster
 train_freq: 1
-gradient_steps: 2  # Kept at 2 — 3 was too slow on MPS (~28 FPS vs ~120 FPS)
+gradient_steps: 2
 
-# Network architecture
+# Network — same as Exp 4
 hidden_sizes:
   - 512
   - 512
@@ -40,47 +42,46 @@ use_layer_norm: true
 # Observation normalization
 normalize_obs: true
 obs_clip: 10.0
-
-# Frame stacking - increased for temporal context at high speeds
 frame_stack: 4
-
-# Max objects to observe - increased for better lookahead
 max_objects: 10
 
-# Reward shaping — AutoResearch Exp 1: strengthen forward-progress signal
-reward_speed_scale: 0.1  # Encourage maintaining speed
+# Reward shaping — same as Exp 4 (crash_penalty=300 validated)
+reward_crash_penalty: 300.0
+reward_survival_bonus: 0.2
+reward_distance_scale: 0.2
+reward_stage_bonus: 500.0
+reward_speed_scale: 0.1
 reward_fuel_bonus: 30.0
-reward_crash_penalty: 75.0  # Increased from 50 — crashes waste distance/fuel, must be punished harder
-reward_stage_bonus: 1000.0  # Increased from 800 — stronger signal for the primary objective
-reward_survival_bonus: 0.15  # Reduced from 0.3 — less incentive to merely survive, more to progress
-reward_distance_scale: 0.1  # Doubled from 0.05 — stronger continuous gradient toward stage completion
 reward_pothole_penalty: 5.0
-reward_distance_milestone: 40.0  # Reduced per-milestone from 50 but fires more often (net +33% density)
-reward_distance_milestone_interval: 300  # Reduced from 500 — denser milestone signal every 300 units
-reward_safe_speed_bonus: 0.08  # Increased from 0.05 — reward aggressive but safe driving
+reward_distance_milestone: 40.0
+reward_distance_milestone_interval: 300
+reward_safe_speed_bonus: 0.08
 
 # Generalization
 randomize_seed: true
 seed_range: 1000
 
-# Curriculum Learning - 10-stage curriculum with adaptive mode
-curriculum_enabled: true
-curriculum_graduation_window: 100  # Rolling window for graduation stats
-curriculum_min_episodes_per_stage: 150  # Reduced from 200 — faster curriculum progression
-curriculum_adaptive_eval_interval: 50  # Re-compute adaptive weights every N episodes
+# Curriculum — DISABLED. Always start from stage 1.
+# This aligns training distribution with eval distribution.
+# Agent must earn its way to higher stages by actually clearing them.
+curriculum_enabled: false
 
 # Logging
 log_interval: 1000
 save_interval: 10000
 checkpoint_dir: rl/sac/checkpoints
 
-# Evaluation - runs after each checkpoint
-eval_episodes: 10  # Number of episodes for evaluation (0 to disable)
-eval_deterministic: true  # Use deterministic policy during eval
+# Evaluation — same as Exp 4
+eval_episodes: 10
+eval_start_stages:
+  - 1
+  - 3
+  - 5
+eval_deterministic: true
 
-# Early stopping (0 to disable)
-early_stopping_patience: 0  # Stop if no eval improvement for N checkpoints
+# Early stopping — disabled
+early_stopping_patience: 0
 
 # Environment
 env_fps: 60
-device: cpu  # CPU is 2.2x faster than MPS for this model size (5382 vs 2413 ops/sec)
+device: cpu

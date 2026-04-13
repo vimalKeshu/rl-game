@@ -1,17 +1,17 @@
 from __future__ import annotations
 
 """
-Improved DQN Training for Cracer Simulation (v2)
+Improved DQN Training for Cracer Simulation (v3)
 
-Key improvements:
-1. Double DQN - Reduces overestimation bias
-2. Dueling Architecture - Separates state value and action advantage
-3. Prioritized Experience Replay (PER) - Samples important transitions more frequently
-4. Random Seed Variation - Different seed each episode for generalization
-5. Frame Stacking - Temporal context for reactive behavior
-6. Observation Noise - Robustness to input variations
-7. Training Visualization - Live plots and CSV logging
-8. Action Entropy Tracking - Monitor policy diversity
+Aligned with SAC reference implementation. Key improvements over v2:
+1. Observation normalization (replaces broken reward normalization)
+2. CurriculumManager - 10-stage curriculum with adaptive mode
+3. Auto-resume from latest checkpoint
+4. Centralized shape_reward() function
+5. Evaluation loop with video recording
+6. max_objects + start_stage support in env reset
+7. Double DQN, Dueling, Prioritized Experience Replay (PER)
+8. Frame stacking for temporal context
 """
 
 import argparse
@@ -25,7 +25,6 @@ import time
 from collections import deque, namedtuple
 from dataclasses import dataclass, fields, asdict
 from typing import Deque, Optional, Tuple, Dict, Any, List
-from itertools import count
 
 import numpy as np
 import torch
@@ -40,10 +39,6 @@ from game import CracerGymEnv  # noqa: E402
 
 
 Transition = namedtuple("Transition", ("state", "action", "next_state", "reward"))
-OBJECT_TYPES = ("enemy", "truck", "race", "fuel", "pothole", "bump")
-FUEL_INDEX = 3
-BASE_STATE_SIZE = 11
-PER_OBJECT_SIZE = 2 + len(OBJECT_TYPES)
 
 
 @dataclass
@@ -53,27 +48,27 @@ class TrainConfig:
     max_steps_per_episode: int = 10_000
 
     # Replay buffer
-    memory_size: int = 100_000
+    memory_size: int = 200_000
     batch_size: int = 64
-    min_replay_size: int = 1_000
+    min_replay_size: int = 5_000
 
     # DQN hyperparameters
     gamma: float = 0.99
     learning_rate: float = 1e-4
-    lr_decay: float = 0.9999
+    lr_decay: float = 1.0
     lr_min: float = 1e-6
 
     # Exploration
     eps_start: float = 1.0
-    eps_end: float = 0.02
+    eps_end: float = 0.05
     eps_decay: float = 50_000.0
 
     # Target network
-    tau: float = 0.001
+    tau: float = 0.005
     target_update_freq: int = 1
 
     # Network architecture
-    hidden_sizes: Tuple[int, ...] = (512, 256, 128)
+    hidden_sizes: Tuple[int, ...] = (512, 512, 256)
     use_dueling: bool = True
     use_double: bool = True
     use_layer_norm: bool = True
@@ -86,238 +81,337 @@ class TrainConfig:
     per_beta_episodes: int = 4_000
     per_epsilon: float = 1e-6
 
-    # Reward shaping
-    reward_speed_scale: float = 0.5
-    reward_fuel_bonus: float = 100.0
-    reward_crash_penalty: float = 200.0
-    reward_pothole_penalty: float = 20.0
-    reward_bump_penalty: float = 10.0
-    reward_survival_bonus: float = 0.5
-    reward_distance_scale: float = 1.0
-    reward_stage_clear_bonus: float = 500.0
+    # Observation normalization (replaces reward normalization)
+    normalize_obs: bool = True
+    obs_clip: float = 10.0
 
-    # Low fuel urgency
-    low_fuel_penalty_scale: float = 2.0
+    # Reward shaping (same scale as SAC)
+    reward_speed_scale: float = 0.1
+    reward_fuel_bonus: float = 30.0
+    reward_crash_penalty: float = 75.0
+    reward_pothole_penalty: float = 5.0
+    reward_survival_bonus: float = 0.15
+    reward_distance_scale: float = 0.1
+    reward_stage_bonus: float = 1000.0
+    reward_distance_milestone: float = 40.0
+    reward_distance_milestone_interval: int = 300
+    reward_safe_speed_bonus: float = 0.08
+
+    # DQN-specific: low fuel urgency
+    low_fuel_penalty_scale: float = 1.0
     low_fuel_threshold: float = 0.3
-
-    # Fuel direction guidance
-    fuel_direction_scale: float = 5.0
-
-    # Episode termination
-    terminate_on_crash: bool = False
-
-    # Reward normalization
-    normalize_rewards: bool = True
-    reward_clip: float = 10.0
 
     # Gradient clipping
     grad_clip_norm: float = 10.0
 
-    # === NEW: Generalization improvements ===
-    # Random seed variation (crucial for generalization!)
-    randomize_seed: bool = True  # Use different seed each episode
-    seed_range: int = 1_000_000  # Range for random seeds
-
     # Frame stacking for temporal context
-    frame_stack: int = 4  # Number of frames to stack (1 = no stacking)
+    frame_stack: int = 4
 
     # Observation noise for robustness
-    obs_noise_std: float = 0.02  # Gaussian noise std (0 = no noise)
+    obs_noise_std: float = 0.0
 
     # Dropout for regularization
-    dropout_rate: float = 0.1
+    dropout_rate: float = 0.0
 
-    # === NEW: Visualization ===
-    plot_interval: int = 100  # Update plots every N episodes
-    save_plots: bool = True  # Save plot images
+    # Generalization
+    randomize_seed: bool = True
+    seed_range: int = 1_000
+
+    # Max objects in observation
+    max_objects: int = 10
+
+    # Curriculum Learning
+    curriculum_enabled: bool = True
+    curriculum_graduation_window: int = 100
+    curriculum_min_episodes_per_stage: int = 150
+    curriculum_adaptive_eval_interval: int = 50
+
+    # Early stopping
+    early_stopping_patience: int = 0  # 0 = disabled
+
+    # Evaluation
+    eval_episodes: int = 10
+    eval_deterministic: bool = True
+
+    # Visualization
+    plot_interval: int = 100
+    save_plots: bool = True
 
     # Checkpointing
     save_every: int = 100
-    save_dir: str = "rl/checkpoints"
+    checkpoint_dir: str = "rl/dqn/checkpoints"
     log_interval: int = 10
 
     # Environment
     seed: int = 42
     device: str = "auto"
-    resume: str = ""
     render: bool = False
 
 
+class ObservationNormalizer:
+    """Running mean/std normalization for observations (Welford's algorithm)."""
+    def __init__(self, obs_size: int, clip: float = 10.0, epsilon: float = 1e-8):
+        self.obs_size = obs_size
+        self.clip = clip
+        self.epsilon = epsilon
+        self.mean = np.zeros(obs_size, dtype=np.float64)
+        self.var = np.ones(obs_size, dtype=np.float64)
+        self.count = 0
+
+    def update(self, obs: np.ndarray):
+        batch_mean = obs.astype(np.float64)
+        batch_var = np.zeros_like(batch_mean)
+        batch_count = 1
+        delta = batch_mean - self.mean
+        total_count = self.count + batch_count
+        self.mean = self.mean + delta * batch_count / total_count
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        M2 = m_a + m_b + np.square(delta) * self.count * batch_count / total_count
+        self.var = M2 / total_count
+        self.count = total_count
+
+    def normalize(self, obs: np.ndarray) -> np.ndarray:
+        normalized = (obs - self.mean.astype(np.float32)) / (np.sqrt(self.var.astype(np.float32)) + self.epsilon)
+        return np.clip(normalized, -self.clip, self.clip)
+
+    def normalize_batch(self, obs: torch.Tensor) -> torch.Tensor:
+        mean = torch.as_tensor(self.mean, device=obs.device, dtype=obs.dtype)
+        var = torch.as_tensor(self.var, device=obs.device, dtype=obs.dtype)
+        normalized = (obs - mean) / (torch.sqrt(var) + self.epsilon)
+        return torch.clamp(normalized, -self.clip, self.clip)
+
+    def get_state(self) -> dict:
+        return {"mean": self.mean.copy(), "var": self.var.copy(), "count": self.count}
+
+    def load_state(self, state: dict):
+        self.mean = state["mean"]
+        self.var = state["var"]
+        self.count = state["count"]
+
+
+class CurriculumManager:
+    """10-stage curriculum with adaptive mode after graduation (mirrors SAC)."""
+
+    STAGES = [
+        ({1: 1.0},                           150, None),
+        ({1: 0.7, 2: 0.3},                   200, 0.30),
+        ({1: 0.4, 2: 0.4, 3: 0.2},           250, 0.25),
+        ({2: 0.2, 3: 0.5, 4: 0.3},           300, 0.20),
+        ({2: 0.05, 3: 0.05, 4: 0.4, 5: 0.5}, 350, 0.15),
+        ({4: 0.25, 5: 0.25, 6: 0.5},         350, 0.15),
+        ({5: 0.3, 6: 0.4, 7: 0.3},           350, 0.10),
+        ({6: 0.2, 7: 0.4, 8: 0.4},           300, 0.10),
+        ({7: 0.3, 8: 0.4, 9: 0.3},           250, 0.10),
+        ({8: 0.2, 9: 0.4, 10: 0.4},          200, 0.10),
+    ]
+
+    def __init__(self, config: TrainConfig):
+        self.window = config.curriculum_graduation_window
+        self.min_episodes = config.curriculum_min_episodes_per_stage
+        self.adaptive_interval = config.curriculum_adaptive_eval_interval
+        self.enabled = config.curriculum_enabled
+
+        self.current_stage = 0
+        self.adaptive = False
+        self.stage_episodes = 0
+
+        self.rewards_buf: List[float] = []
+        self.completions_buf: List[float] = []
+
+        self.adaptive_rewards: Dict[int, List[float]] = {s: [] for s in range(1, 11)}
+        self.adaptive_weights: Dict[int, float] = {s: 1.0 / 10 for s in range(1, 11)}
+        self.adaptive_ep_count = 0
+
+    def sample_stage(self) -> int:
+        if not self.enabled:
+            return 1
+        if not self.adaptive:
+            dist = self.STAGES[self.current_stage][0]
+        else:
+            dist = self.adaptive_weights
+        stages = list(dist.keys())
+        probs = [dist[s] for s in stages]
+        return random.choices(stages, weights=probs, k=1)[0]
+
+    def record_episode(self, reward: float, start_stage: int, max_stage: int) -> Optional[str]:
+        if not self.enabled:
+            return None
+        completed = 1.0 if max_stage > start_stage else 0.0
+        if not self.adaptive:
+            self.rewards_buf.append(reward)
+            self.completions_buf.append(completed)
+            self.stage_episodes += 1
+            if len(self.rewards_buf) > self.window:
+                self.rewards_buf = self.rewards_buf[-self.window:]
+                self.completions_buf = self.completions_buf[-self.window:]
+            return self._check_graduation()
+        else:
+            self.adaptive_rewards[start_stage].append(reward)
+            if len(self.adaptive_rewards[start_stage]) > self.window:
+                self.adaptive_rewards[start_stage] = self.adaptive_rewards[start_stage][-self.window:]
+            self.adaptive_ep_count += 1
+            if self.adaptive_ep_count % self.adaptive_interval == 0:
+                self._recompute_adaptive_weights()
+            return None
+
+    def _check_graduation(self) -> Optional[str]:
+        if self.stage_episodes < self.min_episodes:
+            return None
+        if len(self.rewards_buf) < self.window:
+            return None
+        _, grad_reward, grad_completion = self.STAGES[self.current_stage]
+        mean_reward = np.mean(self.rewards_buf)
+        mean_comp = np.mean(self.completions_buf)
+        reward_ok = mean_reward >= grad_reward
+        comp_ok = grad_completion is None or mean_comp >= grad_completion
+        if reward_ok and comp_ok:
+            old = self.current_stage + 1
+            if self.current_stage < len(self.STAGES) - 1:
+                self.current_stage += 1
+                self.stage_episodes = 0
+                self.rewards_buf.clear()
+                self.completions_buf.clear()
+                return (f"CURRICULUM: Graduated stage {old} -> {self.current_stage + 1} "
+                        f"(reward={mean_reward:.1f}, comp={mean_comp:.2f})")
+            else:
+                self.adaptive = True
+                return (f"CURRICULUM: Completed all 10 stages! Entering adaptive mode "
+                        f"(reward={mean_reward:.1f}, comp={mean_comp:.2f})")
+        return None
+
+    def _recompute_adaptive_weights(self):
+        means = {}
+        for s in range(1, 11):
+            buf = self.adaptive_rewards[s]
+            means[s] = np.mean(buf) if buf else 0.0
+        max_r = max(abs(v) for v in means.values()) if means else 1.0
+        max_r = max(max_r, 1.0)
+        raw = {s: 1.0 / (means[s] / max_r + 0.1) for s in range(1, 11)}
+        total = sum(raw.values())
+        self.adaptive_weights = {s: max(raw[s] / total, 0.05) for s in range(1, 11)}
+        total2 = sum(self.adaptive_weights.values())
+        self.adaptive_weights = {s: w / total2 for s, w in self.adaptive_weights.items()}
+        print(f"ADAPTIVE weights: { {s: f'{w:.3f}' for s, w in self.adaptive_weights.items()} }")
+
+    def get_state(self) -> dict:
+        return {
+            "current_stage": self.current_stage,
+            "adaptive": self.adaptive,
+            "stage_episodes": self.stage_episodes,
+            "rewards_buf": list(self.rewards_buf),
+            "completions_buf": list(self.completions_buf),
+            "adaptive_rewards": {s: list(v) for s, v in self.adaptive_rewards.items()},
+            "adaptive_weights": dict(self.adaptive_weights),
+            "adaptive_ep_count": self.adaptive_ep_count,
+        }
+
+    def load_state(self, state: dict):
+        self.current_stage = state["current_stage"]
+        self.adaptive = state["adaptive"]
+        self.stage_episodes = state["stage_episodes"]
+        self.rewards_buf = state["rewards_buf"]
+        self.completions_buf = state["completions_buf"]
+        self.adaptive_rewards = {int(k): v for k, v in state["adaptive_rewards"].items()}
+        self.adaptive_weights = {int(k): v for k, v in state["adaptive_weights"].items()}
+        self.adaptive_ep_count = state["adaptive_ep_count"]
+
+    def status_str(self) -> str:
+        if self.adaptive:
+            return "adaptive mode"
+        return f"stage {self.current_stage + 1}/10 (ep {self.stage_episodes}/{self.min_episodes})"
+
+
 class TrainingLogger:
-    """Logs training metrics to CSV and generates plots."""
+    """Logs training metrics to CSV."""
 
     def __init__(self, save_dir: str):
         self.save_dir = save_dir
         self.log_file = os.path.join(save_dir, "training_log.csv")
-        self.metrics_history: Dict[str, List[float]] = {
-            "episode": [],
-            "steps": [],
-            "reward": [],
-            "score": [],
-            "episode_length": [],
-            "epsilon": [],
-            "learning_rate": [],
-            "loss": [],
-            "max_stage": [],
-            "fuel_pickups": [],
-            "crashes": [],
-            "mean_reward_100": [],
-            "mean_score_100": [],
-            "mean_stage_100": [],
-            "action_entropy": [],
-        }
+        self.fieldnames = [
+            "episode", "steps", "reward", "score", "episode_length",
+            "epsilon", "learning_rate", "loss", "max_stage",
+            "mean_reward_100", "mean_score_100", "mean_stage_100",
+            "curriculum_stage",
+        ]
         self._init_csv()
 
     def _init_csv(self):
         os.makedirs(self.save_dir, exist_ok=True)
         with open(self.log_file, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(self.metrics_history.keys())
+            writer = csv.DictWriter(f, fieldnames=self.fieldnames)
+            writer.writeheader()
 
     def log(self, **kwargs):
-        for key, value in kwargs.items():
-            if key in self.metrics_history:
-                self.metrics_history[key].append(value)
-
         with open(self.log_file, "a", newline="") as f:
-            writer = csv.writer(f)
-            row = [kwargs.get(k, "") for k in self.metrics_history.keys()]
-            writer.writerow(row)
+            writer = csv.DictWriter(f, fieldnames=self.fieldnames)
+            writer.writerow({k: kwargs.get(k, "") for k in self.fieldnames})
 
     def plot(self, save_path: Optional[str] = None):
         try:
             import matplotlib
-            matplotlib.use('Agg')  # Non-interactive backend
+            matplotlib.use('Agg')
             import matplotlib.pyplot as plt
         except ImportError:
-            print("matplotlib not installed, skipping plots")
             return
 
-        episodes = self.metrics_history["episode"]
-        if len(episodes) < 2:
-            return
+        try:
+            import csv as csv_mod
+            rows = []
+            with open(self.log_file, "r") as f:
+                reader = csv_mod.DictReader(f)
+                for row in reader:
+                    rows.append(row)
+            if len(rows) < 2:
+                return
 
-        fig, axes = plt.subplots(3, 2, figsize=(14, 12))
-        fig.suptitle("DQN Training Progress", fontsize=14, fontweight='bold')
+            episodes = [int(r["episode"]) for r in rows if r["episode"]]
+            rewards = [float(r["reward"]) for r in rows if r["reward"]]
+            mean_rewards = [float(r["mean_reward_100"]) for r in rows if r["mean_reward_100"]]
+            stages = [float(r["max_stage"]) for r in rows if r["max_stage"]]
+            mean_stages = [float(r["mean_stage_100"]) for r in rows if r["mean_stage_100"]]
 
-        # Plot 1: Episode Reward (with moving average)
-        ax = axes[0, 0]
-        rewards = self.metrics_history["reward"]
-        ax.plot(episodes, rewards, alpha=0.3, color='blue', label='Episode Reward')
-        if len(self.metrics_history["mean_reward_100"]) > 0:
-            ax.plot(episodes, self.metrics_history["mean_reward_100"],
-                   color='blue', linewidth=2, label='Mean (100 ep)')
-        ax.set_xlabel("Episode")
-        ax.set_ylabel("Reward")
-        ax.set_title("Episode Reward")
-        ax.legend()
-        ax.grid(True, alpha=0.3)
+            fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+            fig.suptitle("DQN Training Progress", fontsize=14, fontweight='bold')
 
-        # Plot 2: Game Score
-        ax = axes[0, 1]
-        scores = self.metrics_history["score"]
-        ax.plot(episodes, scores, alpha=0.3, color='green', label='Episode Score')
-        if len(self.metrics_history["mean_score_100"]) > 0:
-            ax.plot(episodes, self.metrics_history["mean_score_100"],
-                   color='green', linewidth=2, label='Mean (100 ep)')
-        ax.set_xlabel("Episode")
-        ax.set_ylabel("Score")
-        ax.set_title("Game Score")
-        ax.legend()
-        ax.grid(True, alpha=0.3)
+            ax = axes[0, 0]
+            ax.plot(episodes[:len(rewards)], rewards, alpha=0.3, color='blue', label='Episode')
+            ax.plot(episodes[:len(mean_rewards)], mean_rewards, color='blue', linewidth=2, label='Mean(100)')
+            ax.set_title("Reward")
+            ax.legend()
+            ax.grid(True, alpha=0.3)
 
-        # Plot 3: Max Stage Reached
-        ax = axes[1, 0]
-        stages = self.metrics_history["max_stage"]
-        ax.plot(episodes, stages, alpha=0.5, color='purple', label='Max Stage')
-        if len(self.metrics_history["mean_stage_100"]) > 0:
-            ax.plot(episodes, self.metrics_history["mean_stage_100"],
-                   color='purple', linewidth=2, label='Mean (100 ep)')
-        ax.set_xlabel("Episode")
-        ax.set_ylabel("Stage")
-        ax.set_title("Max Stage Reached")
-        ax.legend()
-        ax.grid(True, alpha=0.3)
+            ax = axes[0, 1]
+            ax.plot(episodes[:len(stages)], stages, alpha=0.5, color='purple', label='Max Stage')
+            ax.plot(episodes[:len(mean_stages)], mean_stages, color='purple', linewidth=2, label='Mean(100)')
+            ax.set_title("Stage Reached")
+            ax.legend()
+            ax.grid(True, alpha=0.3)
 
-        # Plot 4: Episode Length
-        ax = axes[1, 1]
-        lengths = self.metrics_history["episode_length"]
-        ax.plot(episodes, lengths, alpha=0.3, color='orange')
-        # Moving average
-        window = min(100, len(lengths))
-        if window > 1:
-            ma = np.convolve(lengths, np.ones(window)/window, mode='valid')
-            ax.plot(episodes[window-1:], ma, color='orange', linewidth=2, label=f'Mean ({window} ep)')
-        ax.set_xlabel("Episode")
-        ax.set_ylabel("Steps")
-        ax.set_title("Episode Length")
-        ax.legend()
-        ax.grid(True, alpha=0.3)
+            scores = [float(r["score"]) for r in rows if r["score"]]
+            mean_scores = [float(r["mean_score_100"]) for r in rows if r["mean_score_100"]]
+            ax = axes[1, 0]
+            ax.plot(episodes[:len(scores)], scores, alpha=0.3, color='green', label='Score')
+            ax.plot(episodes[:len(mean_scores)], mean_scores, color='green', linewidth=2, label='Mean(100)')
+            ax.set_title("Game Score")
+            ax.legend()
+            ax.grid(True, alpha=0.3)
 
-        # Plot 5: Epsilon and Learning Rate
-        ax = axes[2, 0]
-        ax.plot(episodes, self.metrics_history["epsilon"], color='red', label='Epsilon')
-        ax.set_xlabel("Episode")
-        ax.set_ylabel("Epsilon", color='red')
-        ax.tick_params(axis='y', labelcolor='red')
-        ax2 = ax.twinx()
-        lr_values = self.metrics_history["learning_rate"]
-        ax2.plot(episodes, lr_values, color='cyan', label='Learning Rate')
-        ax2.set_ylabel("Learning Rate", color='cyan')
-        ax2.tick_params(axis='y', labelcolor='cyan')
-        ax.set_title("Exploration & Learning Rate")
-        ax.grid(True, alpha=0.3)
+            losses = [float(r["loss"]) for r in rows if r.get("loss") and r["loss"]]
+            loss_eps = [int(r["episode"]) for r in rows if r.get("loss") and r["loss"]]
+            ax = axes[1, 1]
+            if losses:
+                ax.plot(loss_eps, losses, alpha=0.5, color='brown', label='Loss')
+            ax.set_title("Training Loss")
+            ax.legend()
+            ax.grid(True, alpha=0.3)
 
-        # Plot 6: Loss and Action Entropy
-        ax = axes[2, 1]
-        losses = [l for l in self.metrics_history["loss"] if l and l > 0]
-        loss_eps = [e for e, l in zip(episodes, self.metrics_history["loss"]) if l and l > 0]
-        if losses:
-            ax.plot(loss_eps, losses, alpha=0.5, color='brown', label='Loss')
-            window = min(100, len(losses))
-            if window > 1:
-                ma = np.convolve(losses, np.ones(window)/window, mode='valid')
-                ax.plot(loss_eps[window-1:], ma, color='brown', linewidth=2)
-        ax.set_xlabel("Episode")
-        ax.set_ylabel("Loss", color='brown')
-        ax.tick_params(axis='y', labelcolor='brown')
-        ax.set_title("Training Loss")
-        ax.grid(True, alpha=0.3)
-
-        plt.tight_layout()
-
-        if save_path:
-            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            plt.tight_layout()
+            if save_path:
+                plt.savefig(save_path, dpi=150, bbox_inches='tight')
             plt.close(fig)
-        else:
-            plt.show()
-
-
-class RunningMeanStd:
-    """Tracks running mean and std for reward normalization."""
-    def __init__(self, epsilon: float = 1e-4):
-        self.mean = 0.0
-        self.var = 1.0
-        self.count = epsilon
-
-    def update(self, x: float) -> None:
-        batch_mean = x
-        batch_var = 0.0
-        batch_count = 1
-        self._update_from_moments(batch_mean, batch_var, batch_count)
-
-    def _update_from_moments(self, batch_mean: float, batch_var: float, batch_count: int) -> None:
-        delta = batch_mean - self.mean
-        tot_count = self.count + batch_count
-        self.mean = self.mean + delta * batch_count / tot_count
-        m_a = self.var * self.count
-        m_b = batch_var * batch_count
-        M2 = m_a + m_b + delta ** 2 * self.count * batch_count / tot_count
-        self.var = M2 / tot_count
-        self.count = tot_count
-
-    def normalize(self, x: float) -> float:
-        return (x - self.mean) / (math.sqrt(self.var) + 1e-8)
+        except Exception:
+            pass
 
 
 class FrameStack:
@@ -328,18 +422,15 @@ class FrameStack:
         self.frames: Deque[np.ndarray] = deque(maxlen=num_frames)
 
     def reset(self, obs: np.ndarray) -> np.ndarray:
-        """Reset with initial observation."""
         for _ in range(self.num_frames):
             self.frames.append(obs.copy())
         return self.get()
 
     def push(self, obs: np.ndarray) -> np.ndarray:
-        """Add new frame and return stacked observation."""
         self.frames.append(obs.copy())
         return self.get()
 
     def get(self) -> np.ndarray:
-        """Return stacked frames as single array."""
         return np.concatenate(list(self.frames), axis=0)
 
     @property
@@ -413,7 +504,6 @@ class PrioritizedReplayMemory:
         indices = []
         priorities = []
         segment = self.tree.total() / batch_size
-
         for i in range(batch_size):
             a = segment * i
             b = segment * (i + 1)
@@ -425,12 +515,10 @@ class PrioritizedReplayMemory:
             batch.append(data)
             indices.append(idx)
             priorities.append(priority)
-
         total = self.tree.total()
         probs = np.array(priorities) / total
         weights = (self.tree.n_entries * probs) ** (-beta)
         weights = weights / weights.max()
-
         return batch, weights.astype(np.float32), indices
 
     def update_priorities(self, indices: List[int], td_errors: np.ndarray) -> None:
@@ -451,7 +539,7 @@ class ReplayMemory:
     def push(self, *args) -> None:
         self.memory.append(Transition(*args))
 
-    def sample(self, batch_size: int) -> Tuple[List[Transition], np.ndarray, None]:
+    def sample(self, batch_size: int, beta: float = 0.4) -> Tuple[List[Transition], np.ndarray, None]:
         transitions = random.sample(self.memory, batch_size)
         weights = np.ones(batch_size, dtype=np.float32)
         return transitions, weights, None
@@ -464,19 +552,11 @@ class ReplayMemory:
 
 
 class DuelingQNetwork(nn.Module):
-    """Dueling DQN architecture with dropout for regularization."""
-    def __init__(
-        self,
-        obs_size: int,
-        num_actions: int,
-        hidden_sizes: Tuple[int, ...],
-        use_layer_norm: bool = True,
-        dropout_rate: float = 0.0
-    ) -> None:
+    """Dueling DQN architecture."""
+    def __init__(self, obs_size: int, num_actions: int, hidden_sizes: Tuple[int, ...],
+                 use_layer_norm: bool = True, dropout_rate: float = 0.0) -> None:
         super().__init__()
         self.num_actions = num_actions
-
-        # Shared feature extraction layers
         layers = []
         last_size = obs_size
         for hidden in hidden_sizes[:-1]:
@@ -488,21 +568,16 @@ class DuelingQNetwork(nn.Module):
                 layers.append(nn.Dropout(dropout_rate))
             last_size = hidden
         self.feature_net = nn.Sequential(*layers)
-
-        # Value stream
         value_layers = [nn.Linear(last_size, hidden_sizes[-1])]
         if use_layer_norm:
             value_layers.append(nn.LayerNorm(hidden_sizes[-1]))
         value_layers.extend([nn.ReLU(), nn.Linear(hidden_sizes[-1], 1)])
         self.value_stream = nn.Sequential(*value_layers)
-
-        # Advantage stream
         adv_layers = [nn.Linear(last_size, hidden_sizes[-1])]
         if use_layer_norm:
             adv_layers.append(nn.LayerNorm(hidden_sizes[-1]))
         adv_layers.extend([nn.ReLU(), nn.Linear(hidden_sizes[-1], num_actions)])
         self.advantage_stream = nn.Sequential(*adv_layers)
-
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -515,20 +590,13 @@ class DuelingQNetwork(nn.Module):
         features = self.feature_net(x)
         value = self.value_stream(features)
         advantage = self.advantage_stream(features)
-        q_values = value + advantage - advantage.mean(dim=1, keepdim=True)
-        return q_values
+        return value + advantage - advantage.mean(dim=1, keepdim=True)
 
 
 class QNetwork(nn.Module):
-    """Standard Q-Network with dropout."""
-    def __init__(
-        self,
-        obs_size: int,
-        num_actions: int,
-        hidden_sizes: Tuple[int, ...],
-        use_layer_norm: bool = True,
-        dropout_rate: float = 0.0
-    ) -> None:
+    """Standard Q-Network."""
+    def __init__(self, obs_size: int, num_actions: int, hidden_sizes: Tuple[int, ...],
+                 use_layer_norm: bool = True, dropout_rate: float = 0.0) -> None:
         super().__init__()
         layers = []
         last_size = obs_size
@@ -542,7 +610,6 @@ class QNetwork(nn.Module):
             last_size = hidden
         layers.append(nn.Linear(last_size, num_actions))
         self.net = nn.Sequential(*layers)
-
         nn.init.orthogonal_(self.net[-1].weight, gain=0.01)
         nn.init.constant_(self.net[-1].bias, 0.0)
 
@@ -568,6 +635,227 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def compute_total_distance(info: dict) -> float:
+    """Compute total distance traveled in current episode."""
+    stage = info.get("stage", 1)
+    distance_remaining = info.get("distance_remaining", 0)
+    stage_distance = 4200 + (stage - 1) * 500
+    completed_stages_distance = sum(4200 + i * 500 for i in range(stage - 1))
+    current_stage_progress = stage_distance - distance_remaining
+    return completed_stages_distance + current_stage_progress
+
+
+def shape_reward(reward: float, info: dict, prev_info: dict, config: TrainConfig,
+                 episode_state: dict, max_fuel: float = 100.0) -> float:
+    """Centralized reward shaping (mirrors SAC implementation)."""
+    shaped = reward
+
+    shaped += config.reward_survival_bonus
+
+    speed = info.get("speed", 0)
+    speed_limit = info.get("speed_limit", 220)
+    shaped += speed * config.reward_speed_scale * 0.01
+
+    game_mode = info.get("game_mode", "playing")
+    if game_mode == "playing" and speed >= speed_limit * 0.9:
+        shaped += config.reward_safe_speed_bonus
+
+    total_distance = compute_total_distance(info)
+    prev_total_distance = compute_total_distance(prev_info)
+    distance_delta = total_distance - prev_total_distance
+    if distance_delta > 0:
+        shaped += distance_delta * config.reward_distance_scale
+
+    milestone_interval = config.reward_distance_milestone_interval
+    prev_milestones = int(prev_total_distance / milestone_interval)
+    curr_milestones = int(total_distance / milestone_interval)
+    milestones_achieved = curr_milestones - prev_milestones
+    if milestones_achieved > 0:
+        shaped += config.reward_distance_milestone * milestones_achieved
+
+    fuel_current = info.get("fuel", 0)
+    fuel_prev = prev_info.get("fuel", 0)
+    if fuel_current > fuel_prev + 5:
+        shaped += config.reward_fuel_bonus
+
+    stage_current = info.get("stage", 1)
+    stage_prev = prev_info.get("stage", 1)
+    if stage_current > stage_prev:
+        shaped += config.reward_stage_bonus * stage_current
+
+    if game_mode == "crashed" and prev_info.get("game_mode") == "playing":
+        shaped -= config.reward_crash_penalty
+
+    # DQN-specific: low fuel urgency
+    if config.low_fuel_penalty_scale > 0 and config.low_fuel_threshold > 0:
+        fuel_ratio = max(0.0, min(1.0, fuel_current / max_fuel))
+        if fuel_ratio < config.low_fuel_threshold:
+            urgency = (config.low_fuel_threshold - fuel_ratio) / config.low_fuel_threshold
+            shaped -= config.low_fuel_penalty_scale * urgency
+
+    return shaped
+
+
+def make_video_writer(path: str, fps: float):
+    try:
+        import imageio.v2 as imageio
+    except ImportError:
+        try:
+            import imageio
+        except ImportError:
+            return None
+    try:
+        return imageio.get_writer(path, fps=fps, codec="libx264")
+    except Exception:
+        try:
+            if path.endswith(".mp4"):
+                path = path.replace(".mp4", ".gif")
+            return imageio.get_writer(path, fps=fps)
+        except Exception:
+            return None
+
+
+def evaluate(
+    policy_net: nn.Module,
+    config: TrainConfig,
+    obs_normalizer: Optional[ObservationNormalizer],
+    device: str,
+    num_episodes: int = 10,
+    deterministic: bool = True,
+    global_step: int = 0,
+    record_video: bool = True,
+    video_dir: Optional[str] = None,
+) -> Dict[str, float]:
+    """Run evaluation episodes and return metrics."""
+    render_mode = "rgb_array" if record_video else None
+    eval_env = CracerGymEnv(
+        render_mode=render_mode,
+        obs_mode="state",
+        action_mode="discrete",
+        fps=60,
+        seed=42,
+        max_objects=config.max_objects,
+    )
+
+    base_obs_size = eval_env.observation_space.shape[0]
+    frame_stacker = FrameStack(config.frame_stack, base_obs_size) if config.frame_stack > 1 else None
+
+    episode_rewards = []
+    episode_scores = []
+    episode_stages = []
+    episode_lengths = []
+
+    if video_dir is None:
+        video_dir = os.path.join(ROOT, "rl", "dqn", "runs")
+    os.makedirs(video_dir, exist_ok=True)
+
+    best_episode_reward = float("-inf")
+    best_episode_frames: List[np.ndarray] = []
+    record_fps = 30
+
+    policy_net.eval()
+
+    for ep in range(num_episodes):
+        obs, info = eval_env.reset(seed=42 + ep)
+        obs = np.asarray(obs, dtype=np.float32)
+        if frame_stacker:
+            obs = frame_stacker.reset(obs)
+
+        episode_reward = 0.0
+        episode_length = 0
+        max_stage = 1
+        prev_info = info.copy()
+        episode_state: Dict[str, Any] = {}
+        done = False
+        episode_frames: List[np.ndarray] = []
+
+        if record_video and render_mode == "rgb_array":
+            frame = eval_env.render()
+            if frame is not None:
+                episode_frames.append(frame)
+
+        while not done and episode_length < config.max_steps_per_episode:
+            obs_in = obs_normalizer.normalize(obs) if obs_normalizer else obs
+            with torch.no_grad():
+                obs_tensor = torch.tensor(obs_in, dtype=torch.float32, device=device).unsqueeze(0)
+                q_values = policy_net(obs_tensor)
+                action = int(torch.argmax(q_values, dim=1).item())
+
+            next_obs, reward, terminated, truncated, info = eval_env.step(action)
+            next_obs = np.asarray(next_obs, dtype=np.float32)
+
+            shaped_reward = shape_reward(reward, info, prev_info, config, episode_state)
+            prev_info = info.copy()
+
+            episode_reward += shaped_reward
+            episode_length += 1
+            max_stage = max(max_stage, info.get("stage", 1))
+            done = terminated or truncated
+
+            if record_video and render_mode == "rgb_array" and episode_length % 2 == 0:
+                frame = eval_env.render()
+                if frame is not None:
+                    episode_frames.append(frame)
+
+            if frame_stacker:
+                obs = frame_stacker.push(next_obs)
+            else:
+                obs = next_obs
+
+        episode_rewards.append(episode_reward)
+        episode_scores.append(info.get("score", 0))
+        episode_stages.append(max_stage)
+        episode_lengths.append(episode_length)
+
+        if episode_reward > best_episode_reward:
+            best_episode_reward = episode_reward
+            best_episode_frames = episode_frames
+
+    eval_env.close()
+    policy_net.train()
+
+    video_path = None
+    if record_video and best_episode_frames:
+        video_filename = f"eval_step_{global_step}.mp4"
+        video_path = os.path.join(video_dir, video_filename)
+        writer = make_video_writer(video_path, record_fps)
+        if writer is not None:
+            for frame in best_episode_frames:
+                writer.append_data(frame)
+            writer.close()
+        else:
+            video_path = None
+
+    return {
+        "eval_mean_reward": float(np.mean(episode_rewards)),
+        "eval_std_reward": float(np.std(episode_rewards)),
+        "eval_mean_score": float(np.mean(episode_scores)),
+        "eval_mean_stage": float(np.mean(episode_stages)),
+        "eval_mean_length": float(np.mean(episode_lengths)),
+        "eval_min_reward": float(np.min(episode_rewards)),
+        "eval_max_reward": float(np.max(episode_rewards)),
+        "eval_video_path": video_path,
+    }
+
+
+def find_latest_checkpoint(checkpoint_dir: str) -> Optional[str]:
+    """Find the latest numbered checkpoint in the directory."""
+    if not os.path.exists(checkpoint_dir):
+        return None
+    checkpoint_files = []
+    for f in os.listdir(checkpoint_dir):
+        if f.startswith("checkpoint_") and f.endswith(".pt"):
+            try:
+                ep = int(f.replace("checkpoint_", "").replace(".pt", ""))
+                checkpoint_files.append((ep, f))
+            except ValueError:
+                continue
+    if not checkpoint_files:
+        return None
+    checkpoint_files.sort(key=lambda x: x[0], reverse=True)
+    return os.path.join(checkpoint_dir, checkpoint_files[0][1])
+
+
 def save_checkpoint(
     path: str,
     policy_net: nn.Module,
@@ -577,8 +865,9 @@ def save_checkpoint(
     steps_done: int,
     epsilon: float,
     best_mean: float,
-    reward_stats: Optional[RunningMeanStd] = None,
+    obs_normalizer: Optional[ObservationNormalizer] = None,
     model_config: Optional[dict] = None,
+    curriculum: Optional[CurriculumManager] = None,
 ) -> None:
     payload = {
         "q_net": policy_net.state_dict(),
@@ -589,15 +878,23 @@ def save_checkpoint(
         "epsilon": epsilon,
         "best_mean": best_mean,
     }
-    if reward_stats:
-        payload["reward_stats"] = {"mean": reward_stats.mean, "var": reward_stats.var, "count": reward_stats.count}
-    if model_config:
+    if obs_normalizer is not None:
+        payload["obs_normalizer"] = obs_normalizer.get_state()
+    if model_config is not None:
         payload["model_config"] = model_config
+    if curriculum is not None:
+        payload["curriculum"] = curriculum.get_state()
     torch.save(payload, path)
 
 
 def load_checkpoint(path: str, device: str):
     return torch.load(path, map_location=device, weights_only=False)
+
+
+def add_observation_noise(obs: np.ndarray, noise_std: float) -> np.ndarray:
+    if noise_std <= 0:
+        return obs
+    return obs + np.random.normal(0, noise_std, obs.shape).astype(np.float32)
 
 
 def pump_pygame_events() -> None:
@@ -612,6 +909,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train a DQN agent for cracer-simulation")
     default_config = os.path.join(os.path.dirname(__file__), "config.yaml")
     parser.add_argument("--config", type=str, default=default_config)
+    parser.add_argument("--resume", dest="resume", action="store_true", default=True,
+                        help="Resume from latest checkpoint (default)")
+    parser.add_argument("--no-resume", dest="resume", action="store_false",
+                        help="Start fresh training, ignore existing checkpoints")
     return parser.parse_args()
 
 
@@ -620,13 +921,10 @@ def load_yaml(path: str) -> Dict[str, Any]:
         import yaml
     except ImportError as exc:
         raise RuntimeError("PyYAML is required. Install with `pip install pyyaml`.") from exc
-
     if not os.path.exists(path):
         return {}
-
     with open(path, "r", encoding="utf-8") as handle:
         data = yaml.safe_load(handle) or {}
-
     if not isinstance(data, dict):
         raise ValueError("Config file must contain a YAML mapping (key/value pairs).")
     return data
@@ -638,103 +936,42 @@ def build_config(config_data: Dict[str, Any]) -> TrainConfig:
     extras = sorted(set(config_data.keys()) - valid_fields)
     if extras:
         print(f"Warning: unknown config keys ignored: {', '.join(extras)}")
-
     for field in fields(TrainConfig):
         if field.name in config_data:
             setattr(cfg, field.name, config_data[field.name])
-
     if isinstance(cfg.hidden_sizes, list):
         cfg.hidden_sizes = tuple(int(x) for x in cfg.hidden_sizes)
     return cfg
 
 
-def nearest_fuel_distance(obs: np.ndarray, max_objects: int, frame_stack: int = 1) -> Optional[float]:
-    """Find nearest fuel distance from (possibly stacked) observation."""
-    # If frame stacked, use the most recent frame
-    single_obs_size = BASE_STATE_SIZE + max_objects * PER_OBJECT_SIZE
-    if len(obs) > single_obs_size:
-        # Extract most recent frame (last one in stack)
-        obs = obs[-single_obs_size:]
-
-    if obs is None or len(obs) < BASE_STATE_SIZE + PER_OBJECT_SIZE:
-        return None
-    min_dist = None
-    for idx in range(max_objects):
-        offset = BASE_STATE_SIZE + idx * PER_OBJECT_SIZE
-        if offset + PER_OBJECT_SIZE > len(obs):
-            break
-        dx = float(obs[offset])
-        dy = float(obs[offset + 1])
-        fuel_flag = float(obs[offset + 2 + FUEL_INDEX])
-        if fuel_flag <= 0.5:
-            continue
-        if dy < -0.1:
-            continue
-        dist = math.sqrt(dx * dx + dy * dy)
-        if min_dist is None or dist < min_dist:
-            min_dist = dist
-    return min_dist
-
-
-def add_observation_noise(obs: np.ndarray, noise_std: float) -> np.ndarray:
-    """Add Gaussian noise to observation for robustness."""
-    if noise_std <= 0:
-        return obs
-    noise = np.random.normal(0, noise_std, obs.shape).astype(np.float32)
-    return obs + noise
-
-
-def compute_action_entropy(action_counts: Dict[int, int], num_actions: int) -> float:
-    """Compute entropy of action distribution (higher = more diverse)."""
-    total = sum(action_counts.values())
-    if total == 0:
-        return 0.0
-    entropy = 0.0
-    for count in action_counts.values():
-        if count > 0:
-            p = count / total
-            entropy -= p * math.log(p + 1e-10)
-    # Normalize by max entropy (uniform distribution)
-    max_entropy = math.log(num_actions)
-    return entropy / max_entropy if max_entropy > 0 else 0.0
-
-
 def main() -> None:
     args = parse_args()
     config = build_config(load_yaml(args.config))
-    if not os.path.isabs(config.save_dir):
-        config.save_dir = os.path.join(ROOT, config.save_dir)
-    if config.resume and not os.path.isabs(config.resume):
-        config.resume = os.path.join(ROOT, config.resume)
+    if not os.path.isabs(config.checkpoint_dir):
+        config.checkpoint_dir = os.path.join(ROOT, config.checkpoint_dir)
 
     device = pick_device(config.device)
     print(f"Device: {device}")
-    print(f"Using Double DQN: {config.use_double}")
-    print(f"Using Dueling Architecture: {config.use_dueling}")
-    print(f"Using PER: {config.use_per}")
-    print(f"Using Layer Normalization: {config.use_layer_norm}")
-    print(f"Frame Stacking: {config.frame_stack}")
-    print(f"Observation Noise: {config.obs_noise_std}")
-    print(f"Random Seed per Episode: {config.randomize_seed}")
+    print(f"Double DQN: {config.use_double}, Dueling: {config.use_dueling}, PER: {config.use_per}")
+    print(f"Frame stack: {config.frame_stack}, Obs normalization: {config.normalize_obs}")
     set_seed(int(config.seed))
 
-    # Create environment
     env = CracerGymEnv(
         render_mode="human" if config.render else None,
         obs_mode="state",
         action_mode="discrete",
+        fps=60,
         seed=int(config.seed),
+        max_objects=config.max_objects,
     )
     obs, info = env.reset(seed=int(config.seed))
     max_fuel = float(getattr(env.env, "max_fuel", 100.0))
-    max_objects = int(getattr(env.env, "max_objects", 6))
 
     base_obs_size = env.observation_space.shape[0]
     num_actions = env.action_space.n
-
-    # Frame stacking
-    frame_stacker = FrameStack(config.frame_stack, base_obs_size) if config.frame_stack > 1 else None
     obs_size = base_obs_size * config.frame_stack
+
+    frame_stacker = FrameStack(config.frame_stack, base_obs_size) if config.frame_stack > 1 else None
 
     model_config = {
         "obs_size": int(obs_size),
@@ -744,9 +981,10 @@ def main() -> None:
         "use_layer_norm": config.use_layer_norm,
         "frame_stack": config.frame_stack,
         "dropout_rate": config.dropout_rate,
+        "normalize_obs": config.normalize_obs,
+        "max_objects": config.max_objects,
     }
 
-    # Create networks (both need same architecture for state_dict compatibility)
     NetworkClass = DuelingQNetwork if config.use_dueling else QNetwork
     policy_net = NetworkClass(
         obs_size, num_actions, config.hidden_sizes, config.use_layer_norm, config.dropout_rate
@@ -755,54 +993,59 @@ def main() -> None:
         obs_size, num_actions, config.hidden_sizes, config.use_layer_norm, config.dropout_rate
     ).to(device)
     target_net.load_state_dict(policy_net.state_dict())
-    target_net.eval()  # eval() mode disables dropout
+    target_net.eval()
 
     n_params = sum(p.numel() for p in policy_net.parameters())
     print(f"Network parameters: {n_params:,}")
 
     optimizer = torch.optim.AdamW(policy_net.parameters(), lr=config.learning_rate, amsgrad=True)
 
-    # Create replay buffer
     if config.use_per:
         memory = PrioritizedReplayMemory(config.memory_size, config.per_alpha, config.per_epsilon)
     else:
         memory = ReplayMemory(config.memory_size)
 
-    # Reward normalization
-    reward_stats = RunningMeanStd() if config.normalize_rewards else None
+    obs_normalizer = ObservationNormalizer(obs_size, config.obs_clip) if config.normalize_obs else None
+    curriculum = CurriculumManager(config)
 
-    # Training logger
-    logger = TrainingLogger(config.save_dir)
+    os.makedirs(config.checkpoint_dir, exist_ok=True)
+    logger = TrainingLogger(config.checkpoint_dir)
 
     # Save config
-    config_path = os.path.join(config.save_dir, "config.json")
+    config_path = os.path.join(config.checkpoint_dir, "config.json")
     with open(config_path, "w") as f:
         json.dump(asdict(config), f, indent=2, default=str)
 
     start_episode = 0
     steps_done = 0
-    best_mean = -float("inf")
+    best_mean = float("-inf")
+    best_eval_reward = float("-inf")
+    evals_without_improvement = 0
 
-    if config.resume:
-        checkpoint = load_checkpoint(config.resume, device)
-        policy_net.load_state_dict(checkpoint["q_net"])
-        target_net.load_state_dict(checkpoint["target_net"])
-        optimizer.load_state_dict(checkpoint["optimizer"])
-        start_episode = int(checkpoint.get("episode", 0))
-        steps_done = int(checkpoint.get("steps_done", 0))
-        best_mean = float(checkpoint.get("best_mean", -float("inf")))
-        if reward_stats and "reward_stats" in checkpoint:
-            rs = checkpoint["reward_stats"]
-            reward_stats.mean = rs["mean"]
-            reward_stats.var = rs["var"]
-            reward_stats.count = rs["count"]
+    # Auto-resume from latest checkpoint
+    latest_ckpt = find_latest_checkpoint(config.checkpoint_dir) if args.resume else None
+    if latest_ckpt is not None:
+        print(f"\nFound checkpoint: {latest_ckpt}")
+        ckpt = load_checkpoint(latest_ckpt, device)
+        policy_net.load_state_dict(ckpt["q_net"])
+        target_net.load_state_dict(ckpt["target_net"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        start_episode = int(ckpt.get("episode", 0))
+        steps_done = int(ckpt.get("steps_done", 0))
+        best_mean = float(ckpt.get("best_mean", float("-inf")))
+        if obs_normalizer and "obs_normalizer" in ckpt:
+            obs_normalizer.load_state(ckpt["obs_normalizer"])
+        if "curriculum" in ckpt:
+            curriculum.load_state(ckpt["curriculum"])
         print(f"Resumed from episode {start_episode}, steps {steps_done}")
-
-    os.makedirs(config.save_dir, exist_ok=True)
+        print(f"  Curriculum: {curriculum.status_str()}")
+    elif args.resume:
+        print("\nNo checkpoint found, starting fresh training")
+    else:
+        print("\nStarting fresh training (--no-resume specified)")
 
     reward_window: Deque[float] = deque(maxlen=100)
     score_window: Deque[float] = deque(maxlen=100)
-    steps_window: Deque[int] = deque(maxlen=100)
     stage_window: Deque[int] = deque(maxlen=100)
     loss_window: Deque[float] = deque(maxlen=100)
     last_log_time = time.time()
@@ -816,28 +1059,24 @@ def main() -> None:
         return config.per_beta_start + progress * (config.per_beta_end - config.per_beta_start)
 
     def select_action(state: torch.Tensor, steps: int) -> Tuple[torch.Tensor, float]:
-        eps_threshold = epsilon_by_steps(steps)
-        if random.random() > eps_threshold:
+        eps = epsilon_by_steps(steps)
+        if random.random() > eps:
             with torch.no_grad():
                 policy_net.eval()
                 action = policy_net(state).max(1).indices.view(1, 1)
                 policy_net.train()
         else:
             action = torch.tensor([[env.action_space.sample()]], device=device, dtype=torch.long)
-        return action, eps_threshold
+        return action, eps
 
     def optimize_model(beta: float = 0.4) -> Optional[float]:
         if len(memory) < config.min_replay_size:
             return None
-
         transitions, weights, indices = memory.sample(config.batch_size, beta)
         batch = Transition(*zip(*transitions))
 
         non_final_mask = torch.tensor(
-            tuple(next_state is not None for next_state in batch.next_state),
-            device=device,
-            dtype=torch.bool,
-        )
+            tuple(s is not None for s in batch.next_state), device=device, dtype=torch.bool)
         non_final_next_states = None
         non_final_list = [s for s in batch.next_state if s is not None]
         if non_final_list:
@@ -848,6 +1087,12 @@ def main() -> None:
         reward_batch = torch.cat(batch.reward)
         weights_tensor = torch.tensor(weights, device=device)
 
+        # Normalize batches if obs_normalizer is active
+        if obs_normalizer:
+            state_batch = obs_normalizer.normalize_batch(state_batch)
+            if non_final_next_states is not None:
+                non_final_next_states = obs_normalizer.normalize_batch(non_final_next_states)
+
         state_action_values = policy_net(state_batch).gather(1, action_batch)
 
         next_state_values = torch.zeros(config.batch_size, device=device)
@@ -855,19 +1100,16 @@ def main() -> None:
             with torch.no_grad():
                 if config.use_double:
                     next_actions = policy_net(non_final_next_states).max(1).indices.unsqueeze(1)
-                    next_state_values[non_final_mask] = target_net(non_final_next_states).gather(1, next_actions).squeeze(1)
+                    next_state_values[non_final_mask] = (
+                        target_net(non_final_next_states).gather(1, next_actions).squeeze(1))
                 else:
                     next_state_values[non_final_mask] = target_net(non_final_next_states).max(1).values
 
         expected_state_action_values = reward_batch + (config.gamma * next_state_values)
-
         td_errors = (state_action_values.squeeze(1) - expected_state_action_values).detach().cpu().numpy()
 
         element_wise_loss = F.smooth_l1_loss(
-            state_action_values.squeeze(1),
-            expected_state_action_values,
-            reduction='none'
-        )
+            state_action_values.squeeze(1), expected_state_action_values, reduction='none')
         loss = (element_wise_loss * weights_tensor).mean()
 
         optimizer.zero_grad()
@@ -881,10 +1123,8 @@ def main() -> None:
         return float(loss.item())
 
     def soft_update_target() -> None:
-        for target_param, policy_param in zip(target_net.parameters(), policy_net.parameters()):
-            target_param.data.copy_(
-                config.tau * policy_param.data + (1.0 - config.tau) * target_param.data
-            )
+        for tgt, pol in zip(target_net.parameters(), policy_net.parameters()):
+            tgt.data.copy_(config.tau * pol.data + (1.0 - config.tau) * tgt.data)
 
     def decay_lr() -> float:
         for param_group in optimizer.param_groups:
@@ -896,154 +1136,87 @@ def main() -> None:
     current_lr = config.learning_rate
     eps_threshold = epsilon_by_steps(steps_done)
 
-    print(f"\nStarting training from episode {start_episode + 1}")
+    print(f"\nStarting DQN training from episode {start_episode + 1}")
     print(f"Epsilon: {eps_threshold:.3f} -> {config.eps_end:.3f}")
-    print(f"Learning rate: {current_lr:.2e}")
+    if config.curriculum_enabled:
+        print(f"Curriculum: {curriculum.status_str()}")
     print("-" * 80)
 
+    start_time = time.time()
+
     for episode_idx in range(start_episode, config.total_episodes):
-        # Random seed for generalization
-        if config.randomize_seed:
-            episode_seed = random.randint(0, config.seed_range)
-        else:
-            episode_seed = config.seed
+        episode_seed = random.randint(0, config.seed_range) if config.randomize_seed else config.seed
+        start_stage = curriculum.sample_stage()
 
-        obs, info = env.reset(seed=episode_seed)
+        obs, info = env.reset(seed=episode_seed, options={"start_stage": start_stage})
+        obs = np.asarray(obs, dtype=np.float32)
 
-        # Frame stacking
         if frame_stacker:
             stacked_obs = frame_stacker.reset(obs)
         else:
-            stacked_obs = obs
+            stacked_obs = obs.copy()
 
-        # Add observation noise
         if config.obs_noise_std > 0:
             stacked_obs = add_observation_noise(stacked_obs, config.obs_noise_std)
 
-        prev_fuel = float(info.get("fuel", 0.0))
-        prev_lives = int(info.get("lives", 0))
-        prev_message = info.get("message") or ""
-        prev_distance = float(info.get("distance_remaining", 0.0))
-        prev_stage = int(info.get("stage", 1))
-        prev_fuel_dist = nearest_fuel_distance(obs, max_objects)
+        # Update obs normalizer with initial obs
+        if obs_normalizer:
+            obs_normalizer.update(stacked_obs)
 
-        # Episode statistics
-        fuel_events = 0
-        crash_events = 0
-        pothole_events = 0
-        bump_events = 0
-        max_stage = 1
-        action_counts: Dict[int, int] = {i: 0 for i in range(num_actions)}
+        prev_info = info.copy()
+        episode_state: Dict[str, Any] = {}
+
+        max_stage = start_stage
         episode_losses: List[float] = []
 
+        state_raw = stacked_obs.copy()  # raw for buffer
         state = torch.tensor(stacked_obs, dtype=torch.float32, device=device).unsqueeze(0)
         episode_reward = 0.0
         episode_score = 0.0
 
         beta = beta_by_episode(episode_idx)
 
-        for t in count():
+        done = False
+        t = 0
+        while not done and t < config.max_steps_per_episode:
             action, eps_threshold = select_action(state, steps_done)
             action_int = int(action.item())
-            action_counts[action_int] = action_counts.get(action_int, 0) + 1
             steps_done += 1
 
             next_obs, reward, terminated, truncated, info = env.step(action_int)
+            next_obs = np.asarray(next_obs, dtype=np.float32)
 
-            message = info.get("message") or ""
-            speed = float(info.get("speed", 0.0))
-            fuel_now = float(info.get("fuel", prev_fuel))
-            lives_now = int(info.get("lives", prev_lives))
-            distance_now = float(info.get("distance_remaining", prev_distance))
-            stage_now = int(info.get("stage", prev_stage))
-            score = float(info.get("score", 0.0))
-            episode_score = score
-            max_stage = max(max_stage, stage_now)
+            max_stage = max(max_stage, int(info.get("stage", 1)))
+            episode_score = float(info.get("score", 0.0))
 
-            dt = getattr(env.env, "dt", 1.0 / 60.0)
-            speed_reward = speed * dt * 0.6
+            shaped_reward = shape_reward(reward, info, prev_info, config, episode_state, max_fuel)
+            prev_info = info.copy()
+            episode_reward += shaped_reward
 
-            shaped_reward = (reward - speed_reward) + speed_reward * config.reward_speed_scale
-            shaped_reward += config.reward_survival_bonus
-
-            if prev_distance > 0:
-                distance_progress = prev_distance - distance_now
-                if distance_progress > 0:
-                    shaped_reward += config.reward_distance_scale * distance_progress * 0.01
-
-            fuel_pickup = (fuel_now - prev_fuel) > 1.0 and not message.startswith("STAGE")
-            crash_event = lives_now < prev_lives
-            pothole_event = message == "POTHOLE!" and prev_message != "POTHOLE!"
-            bump_event = message == "BUMP!" and prev_message != "BUMP!"
-            stage_clear = stage_now > prev_stage
-
-            if fuel_pickup:
-                shaped_reward += config.reward_fuel_bonus
-                fuel_events += 1
-
-            if crash_event:
-                shaped_reward -= config.reward_crash_penalty
-                crash_events += 1
-                if config.terminate_on_crash:
-                    terminated = True
-
-            if pothole_event:
-                shaped_reward -= config.reward_pothole_penalty
-                pothole_events += 1
-
-            if bump_event:
-                shaped_reward -= config.reward_bump_penalty
-                bump_events += 1
-
-            if stage_clear:
-                shaped_reward += config.reward_stage_clear_bonus * stage_now
-
-            if config.low_fuel_penalty_scale > 0.0 and config.low_fuel_threshold > 0.0:
-                fuel_ratio = max(0.0, min(1.0, fuel_now / max_fuel))
-                if fuel_ratio < config.low_fuel_threshold:
-                    urgency = (config.low_fuel_threshold - fuel_ratio) / config.low_fuel_threshold
-                    shaped_reward -= config.low_fuel_penalty_scale * urgency
-
-            next_fuel_dist = nearest_fuel_distance(next_obs, max_objects)
-            if prev_fuel_dist is not None and next_fuel_dist is not None:
-                fuel_dir_delta = prev_fuel_dist - next_fuel_dist
-                if config.fuel_direction_scale != 0.0:
-                    shaped_reward += config.fuel_direction_scale * fuel_dir_delta
-            prev_fuel_dist = next_fuel_dist
-
-            if reward_stats is not None:
-                reward_stats.update(shaped_reward)
-                shaped_reward = reward_stats.normalize(shaped_reward)
-                shaped_reward = max(-config.reward_clip, min(config.reward_clip, shaped_reward))
-
-            reward_value = float(shaped_reward)
-            episode_reward += reward_value
-
-            # Frame stacking for next state
             if frame_stacker:
-                next_stacked_obs = frame_stacker.push(next_obs)
+                next_stacked = frame_stacker.push(next_obs)
             else:
-                next_stacked_obs = next_obs
+                next_stacked = next_obs.copy()
 
             if config.obs_noise_std > 0:
-                next_stacked_obs = add_observation_noise(next_stacked_obs, config.obs_noise_std)
+                next_stacked = add_observation_noise(next_stacked, config.obs_noise_std)
 
-            reward_tensor = torch.tensor([reward_value], device=device)
+            # Update obs normalizer
+            if obs_normalizer:
+                obs_normalizer.update(next_stacked)
+
             done = terminated or truncated
+            reward_tensor = torch.tensor([shaped_reward], device=device)
 
+            next_state_raw = next_stacked
             if not done:
-                next_state = torch.tensor(next_stacked_obs, dtype=torch.float32, device=device).unsqueeze(0)
+                next_state = torch.tensor(next_stacked, dtype=torch.float32, device=device).unsqueeze(0)
             else:
                 next_state = None
 
             memory.push(state, action, next_state, reward_tensor)
-            state = next_state if next_state is not None else torch.tensor(next_stacked_obs, dtype=torch.float32, device=device).unsqueeze(0)
-
-            prev_fuel = fuel_now
-            prev_lives = lives_now
-            prev_message = message
-            prev_distance = distance_now
-            prev_stage = stage_now
+            state = (next_state if next_state is not None
+                     else torch.tensor(next_stacked, dtype=torch.float32, device=device).unsqueeze(0))
 
             loss = optimize_model(beta)
             if loss is not None:
@@ -1052,111 +1225,129 @@ def main() -> None:
             if steps_done % config.target_update_freq == 0:
                 soft_update_target()
 
-            # NOTE: LR decay moved to end of episode (was per-step before)
-
             if config.render:
                 env.render()
                 pump_pygame_events()
 
-            if done or t >= config.max_steps_per_episode:
-                break
+            t += 1
 
-        # Episode statistics
+        # Episode done
         reward_window.append(episode_reward)
         score_window.append(episode_score)
-        steps_window.append(t + 1)
         stage_window.append(max_stage)
         avg_loss = sum(episode_losses) / max(1, len(episode_losses)) if episode_losses else 0
         loss_window.append(avg_loss)
 
-        mean_reward = sum(reward_window) / max(1, len(reward_window))
-        mean_score = sum(score_window) / max(1, len(score_window))
-        mean_steps = sum(steps_window) / max(1, len(steps_window))
-        mean_stage = sum(stage_window) / max(1, len(stage_window))
-        mean_loss = sum(loss_window) / max(1, len(loss_window))
-        action_entropy = compute_action_entropy(action_counts, num_actions)
+        mean_reward = float(np.mean(reward_window))
+        mean_score = float(np.mean(score_window))
+        mean_stage = float(np.mean(stage_window))
 
-        # Decay learning rate per EPISODE (not per step!)
+        # Decay learning rate per episode
         current_lr = decay_lr()
 
-        # Log metrics
+        # Record in curriculum
+        grad_msg = curriculum.record_episode(episode_reward, start_stage, max_stage)
+        if grad_msg:
+            print(f"\n  {grad_msg}\n")
+
         logger.log(
             episode=episode_idx + 1,
             steps=steps_done,
             reward=episode_reward,
             score=episode_score,
-            episode_length=t + 1,
+            episode_length=t,
             epsilon=eps_threshold,
             learning_rate=current_lr,
             loss=avg_loss,
             max_stage=max_stage,
-            fuel_pickups=fuel_events,
-            crashes=crash_events,
             mean_reward_100=mean_reward,
             mean_score_100=mean_score,
             mean_stage_100=mean_stage,
-            action_entropy=action_entropy,
+            curriculum_stage=curriculum.current_stage + 1 if not curriculum.adaptive else "adaptive",
         )
 
         if (episode_idx + 1) % config.log_interval == 0:
             now = time.time()
-            step_delta = steps_done - last_log_step
-            steps_per_sec = step_delta / max(1e-6, now - last_log_time)
+            sps = (steps_done - last_log_step) / max(1e-6, now - last_log_time)
             last_log_time = now
             last_log_step = steps_done
-
+            elapsed = now - start_time
             print(
-                f"ep={episode_idx + 1:5d} | "
-                f"steps={steps_done:7d} | "
-                f"mean_r={mean_reward:7.1f} | "
-                f"mean_score={mean_score:8.0f} | "
-                f"stage={mean_stage:.1f} | "
-                f"eps={eps_threshold:.3f} | "
-                f"entropy={action_entropy:.2f} | "
-                f"sps={steps_per_sec:5.0f}"
+                f"ep={episode_idx + 1:5d} | steps={steps_done:7d} | "
+                f"mean_r={mean_reward:7.1f} | score={mean_score:8.0f} | "
+                f"stage={mean_stage:.1f} | eps={eps_threshold:.3f} | "
+                f"sps={sps:5.0f} | curriculum={curriculum.status_str()}"
             )
 
-        # Update plots
         if config.save_plots and (episode_idx + 1) % config.plot_interval == 0:
-            plot_path = os.path.join(config.save_dir, "training_progress.png")
+            plot_path = os.path.join(config.checkpoint_dir, "training_progress.png")
             logger.plot(save_path=plot_path)
 
-        # Save best checkpoint
+        # Save best training checkpoint
         if len(reward_window) >= 10 and mean_reward > best_mean:
             best_mean = mean_reward
-            best_path = os.path.join(config.save_dir, "best.pt")
-            save_checkpoint(
-                best_path, policy_net, target_net, optimizer,
-                episode_idx + 1, steps_done, eps_threshold, best_mean,
-                reward_stats, model_config
-            )
-            print(f"  -> New best model saved! mean_reward={best_mean:.1f}")
+            best_path = os.path.join(config.checkpoint_dir, "best.pt")
+            save_checkpoint(best_path, policy_net, target_net, optimizer,
+                           episode_idx + 1, steps_done, eps_threshold, best_mean,
+                           obs_normalizer, model_config, curriculum)
+            print(f"  -> New best model! mean_reward={best_mean:.1f}")
 
-        # Periodic checkpoint
+        # Periodic checkpoint + evaluation
         if config.save_every > 0 and (episode_idx + 1) % config.save_every == 0:
-            checkpoint_path = os.path.join(config.save_dir, f"episode_{episode_idx + 1}.pt")
-            save_checkpoint(
-                checkpoint_path, policy_net, target_net, optimizer,
-                episode_idx + 1, steps_done, eps_threshold, best_mean,
-                reward_stats, model_config
-            )
+            checkpoint_path = os.path.join(config.checkpoint_dir, f"checkpoint_{episode_idx + 1}.pt")
+            save_checkpoint(checkpoint_path, policy_net, target_net, optimizer,
+                           episode_idx + 1, steps_done, eps_threshold, best_mean,
+                           obs_normalizer, model_config, curriculum)
 
-    # Save final checkpoint and plots
-    final_path = os.path.join(config.save_dir, "final.pt")
-    save_checkpoint(
-        final_path, policy_net, target_net, optimizer,
-        config.total_episodes, steps_done, eps_threshold, best_mean,
-        reward_stats, model_config
-    )
+            if config.eval_episodes > 0:
+                print(f"\n  Running evaluation ({config.eval_episodes} episodes)...")
+                eval_metrics = evaluate(
+                    policy_net, config, obs_normalizer, device,
+                    num_episodes=config.eval_episodes,
+                    deterministic=config.eval_deterministic,
+                    global_step=steps_done,
+                    record_video=True,
+                )
+                print(f"  Eval reward: {eval_metrics['eval_mean_reward']:.1f} ± {eval_metrics['eval_std_reward']:.1f}")
+                print(f"  Eval score: {eval_metrics['eval_mean_score']:.0f} | "
+                      f"Stage: {eval_metrics['eval_mean_stage']:.1f} | "
+                      f"Length: {eval_metrics['eval_mean_length']:.0f}")
+                if eval_metrics.get('eval_video_path'):
+                    print(f"  Video saved: {eval_metrics['eval_video_path']}")
+                print()
+
+                if eval_metrics['eval_mean_reward'] > best_eval_reward:
+                    best_eval_reward = eval_metrics['eval_mean_reward']
+                    evals_without_improvement = 0
+                    save_checkpoint(
+                        os.path.join(config.checkpoint_dir, "best_eval.pt"),
+                        policy_net, target_net, optimizer,
+                        episode_idx + 1, steps_done, eps_threshold, best_mean,
+                        obs_normalizer, model_config, curriculum)
+                    print(f"  New best eval reward: {best_eval_reward:.1f} - saved best_eval.pt")
+                else:
+                    evals_without_improvement += 1
+                    if config.early_stopping_patience > 0:
+                        print(f"  No improvement for {evals_without_improvement}/{config.early_stopping_patience} evals")
+
+                if config.early_stopping_patience > 0 and evals_without_improvement >= config.early_stopping_patience:
+                    print(f"\nEarly stopping triggered after {evals_without_improvement} evals without improvement")
+                    break
+
+    # Final save
+    final_path = os.path.join(config.checkpoint_dir, "final.pt")
+    save_checkpoint(final_path, policy_net, target_net, optimizer,
+                   config.total_episodes, steps_done, eps_threshold, best_mean,
+                   obs_normalizer, model_config, curriculum)
 
     if config.save_plots:
-        plot_path = os.path.join(config.save_dir, "training_progress.png")
+        plot_path = os.path.join(config.checkpoint_dir, "training_progress.png")
         logger.plot(save_path=plot_path)
-        print(f"Training plots saved to {plot_path}")
 
-    print(f"\nTraining complete! Final checkpoint saved to {final_path}")
-    print(f"Best mean reward: {best_mean:.1f}")
     env.close()
+    print(f"\nTraining complete! Episodes: {config.total_episodes}, Steps: {steps_done}")
+    print(f"Best mean reward: {best_mean:.1f}")
+    print(f"Checkpoints saved to: {config.checkpoint_dir}")
 
 
 if __name__ == "__main__":

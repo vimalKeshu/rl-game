@@ -1,20 +1,22 @@
-# BALANCED DQN Config - Generalization WITHOUT breaking learning
-# Key insight: normalize_rewards was the problem, NOT random seeds
+# DQN Training Configuration for Cracer Sim
+# Aligned with SAC reference implementation (v3)
+# Key fixes: obs normalization (replaces broken reward normalization),
+# CurriculumManager, centralized shape_reward, evaluate()
 
 # Training duration
 total_episodes: 5000
 max_steps_per_episode: 10000
 
 # Replay buffer
-memory_size: 100000
+memory_size: 200000
 batch_size: 64
-min_replay_size: 1000
+min_replay_size: 5000
 
 # DQN hyperparameters
 gamma: 0.99
 learning_rate: 0.0001
 lr_decay: 1.0
-lr_min: 0.00001
+lr_min: 0.000001
 
 # Exploration
 eps_start: 1.0
@@ -27,7 +29,8 @@ target_update_freq: 1
 
 # Network architecture
 hidden_sizes:
-  - 256
+  - 512
+  - 512
   - 256
 use_dueling: true
 use_double: true
@@ -41,57 +44,68 @@ per_beta_end: 1.0
 per_beta_episodes: 4000
 per_epsilon: 0.000001
 
-# Reward shaping - BALANCED for crash avoidance
-reward_speed_scale: 0.1  # Low - don't let speed dominate
-reward_fuel_bonus: 50.0
-reward_crash_penalty: 100.0  # RAW value - actually hurts now!
-reward_pothole_penalty: 10.0
-reward_bump_penalty: 5.0
-reward_survival_bonus: 0.1
-reward_distance_scale: 0.5
-reward_stage_clear_bonus: 200.0
+# Observation normalization (replaces reward normalization)
+normalize_obs: true
+obs_clip: 10.0
 
-# Low fuel urgency
+# Reward shaping — aligned with SAC Exp 1b config
+reward_speed_scale: 0.1
+reward_fuel_bonus: 30.0
+reward_crash_penalty: 75.0
+reward_pothole_penalty: 5.0
+reward_survival_bonus: 0.15
+reward_distance_scale: 0.1
+reward_stage_bonus: 1000.0
+reward_distance_milestone: 40.0
+reward_distance_milestone_interval: 300
+reward_safe_speed_bonus: 0.08
+
+# DQN-specific: low fuel urgency
 low_fuel_penalty_scale: 1.0
 low_fuel_threshold: 0.3
-
-# Fuel direction guidance
-fuel_direction_scale: 2.0
-
-# Episode termination
-terminate_on_crash: false
-
-# THE FIX: No normalization = crash penalty actually matters
-normalize_rewards: false
-reward_clip: 10.0
 
 # Gradient clipping
 grad_clip_norm: 10.0
 
-# === GENERALIZATION - MODERATE ===
-randomize_seed: true  # YES - for generalization
-seed_range: 100  # Only 100 seeds, not 1 million! Agent sees each ~50 times
+# Frame stacking for temporal context
+frame_stack: 4
 
-# Frame stacking - disabled (simpler)
-frame_stack: 1
-
-# Observation noise - disabled
+# Observation noise — disabled (obs norm is sufficient)
 obs_noise_std: 0.0
 
-# Dropout - disabled
+# Dropout — disabled
 dropout_rate: 0.0
 
-# === VISUALIZATION ===
+# Max objects in observation
+max_objects: 10
+
+# Generalization
+randomize_seed: true
+seed_range: 1000  # 1K seeds — agent sees each ~5 times over 5K episodes
+
+# Curriculum Learning — 10-stage with graduation (mirrors SAC)
+curriculum_enabled: true
+curriculum_graduation_window: 100
+curriculum_min_episodes_per_stage: 150
+curriculum_adaptive_eval_interval: 50
+
+# Early stopping (0 = disabled)
+early_stopping_patience: 0
+
+# Evaluation — runs after each checkpoint
+eval_episodes: 10
+eval_deterministic: true
+
+# Visualization
 plot_interval: 100
 save_plots: true
 
 # Checkpointing
 save_every: 100
-save_dir: rl/checkpoints
+checkpoint_dir: rl/dqn/checkpoints
 log_interval: 10
 
 # Environment
 seed: 42
-device: auto
-resume: ""
+device: cpu  # CPU is 2.2x faster than MPS for this model size
 render: false
