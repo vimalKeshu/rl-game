@@ -1,83 +1,101 @@
-# Improved PPO Training Configuration for Cracer Sim
-# With learning rate annealing, observation normalization, and better reward shaping
+# PPO Training Configuration — Experiment 18
+#
+# FRESH TRAINING FROM SCRATCH — no warm-start, random weights
+#
+# Why Option A (fresh training):
+#   Exps 16 and 17 confirmed the warm-start lineage (from Exp9) is fully saturated.
+#   Policy loss in Exp17 was 10x smaller than Exp16 — gradients near zero.
+#   Stage-1 avg was 5.2 at step 0 of Exp16 and still 5.2 at step 16M.
+#   No amount of fine-tuning can escape a local optimum this deep.
+#
+# Fresh training strategy:
+#   - Random weight init (standard orthogonal)
+#   - High LR (3e-4) — standard PPO starting LR, 30x higher than Exp16/17
+#   - High entropy (0.01) — new policy needs real exploration
+#   - Stage mix heavily weighted on stage 1 (70%) — build cold-start skill first
+#     The warm-start lineage never had to learn stage 1 from scratch properly;
+#     it inherited Exp1's weights. A fresh policy must earn every stage.
+#   - rollout_steps: 4096 back to proven setting (16384 was worse)
+#   - All validated reward structure kept (crash scale, fuel bonus, etc.)
+#
+# Stage mix rationale:
+#   70% stage-1: force the agent to learn cold-start robustly
+#   20% stage-2: learn to continue after clearing stage 1
+#   10% stage-3: small taste of what's ahead
+#   No stages 4+: don't confuse a fresh policy with situations it can't handle yet
+#
+# After this run we can warm-start Exp19 from the best checkpoint here,
+# but this time the foundation will be genuinely learned, not inherited.
 
-# Training duration
-total_timesteps: 1000000
-max_episode_steps: 10000
+total_timesteps: 20000000
+max_episode_steps: 100000  # Never cut off a live agent
 
-# PPO Hyperparameters
 learning_rate: 0.0003
-learning_rate_end: 0.00001
+learning_rate_end: 0.000005
 anneal_lr: true
-gamma: 0.995
-gae_lambda: 0.97
+gamma: 0.99
+gae_lambda: 0.98
 clip_epsilon: 0.2
 value_coef: 0.5
-entropy_coef: 0.05
-entropy_coef_end: 0.01
+entropy_coef: 0.01
+entropy_coef_end: 0.001
 anneal_entropy: true
 max_grad_norm: 0.5
+normalize_returns: false
 
-# Training
-rollout_steps: 2048
-num_epochs: 10
+rollout_steps: 4096
+num_epochs: 8
 batch_size: 64
 
-# Network architecture - larger for better learning
 hidden_sizes:
+  - 512
   - 512
   - 512
   - 256
 use_layer_norm: true
 shared_backbone: false
 
-# Observation normalization
 normalize_obs: true
 obs_clip: 10.0
-
-# Frame stacking
 frame_stack: 4
+max_objects: 10
 
-# Reward shaping - optimized for stage progression
-reward_speed_scale: 0.05
-reward_fuel_bonus: 30.0
-reward_crash_penalty: 50.0
-reward_stage_bonus: 800.0
-reward_survival_bonus: 0.1
-reward_distance_scale: 0.03
-reward_distance_milestone: 50.0  # Bonus every N distance
-reward_distance_milestone_interval: 500
-reward_pothole_penalty: 5.0
-reward_near_miss_bonus: 2.0
+# Validated reward structure — unchanged
+reward_crash_penalty: 600.0
+reward_crash_penalty_stage_scale: 0.4
+reward_survival_bonus: 0.2
+reward_distance_scale: 0.2
+reward_stage_bonus: 500.0
+reward_speed_scale: 0.1
+reward_fuel_bonus: 45.0
+reward_pothole_penalty: 8.0
+reward_distance_milestone: 40.0
+reward_distance_milestone_interval: 300
+reward_safe_speed_bonus: 0.08
 
-# Generalization
 randomize_seed: true
-seed_range: 100
+seed_range: 1000
 
-# Curriculum Learning - gradually expose agent to harder stages
-curriculum_enabled: true
-curriculum_warmup_steps: 50000
-curriculum_stage_probs:
-  - 0.30
-  - 0.25
-  - 0.20
-  - 0.25
-curriculum_max_stage: 10
+# Heavy stage-1 focus — fresh policy must earn cold-start robustness
+stage_mix:
+  1:  0.70   # primary training stage — build cold-start from scratch
+  2:  0.20   # learn to continue after stage 1 clear
+  3:  0.10   # small taste of what follows
 
-# Evaluation (periodic during training)
-eval_interval_updates: 50
-eval_episodes: 5
+curriculum_enabled: false
+early_stopping_patience: 0
+
+eval_interval_updates: 25
+eval_episodes: 10
 eval_start_stages:
-  - 10
+  - 1
+  - 3
 eval_deterministic: true
-eval_max_episode_steps: 10000
+eval_max_episode_steps: 100000  # Never cut off a live agent
 
-# Logging
 log_interval: 1
-save_interval: 10
+save_interval: 25
 checkpoint_dir: rl/ppo/checkpoints
 
-# Environment
 env_fps: 60
-seed: 42
-device: auto
+device: cpu

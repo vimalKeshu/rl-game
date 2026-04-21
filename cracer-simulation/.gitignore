@@ -16,5 +16,7 @@ build/
 dist/
 *.egg-info/
 
-# rl/checkpoints/
-# rl/runs/
+# Generated training artifacts — use `git add -f` to force-add if needed
+**/*.pt
+**/*.mp4
+**/*.gif

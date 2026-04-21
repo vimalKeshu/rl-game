@@ -144,6 +144,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=str, default=default_checkpoint)
     parser.add_argument("--output", type=str, default="")
     parser.add_argument("--episodes", type=int, default=1)
+    parser.add_argument("--infinite", action="store_true",
+                        help="Run indefinitely until Ctrl+C — beast mode. Tracks cumulative stats.")
     parser.add_argument("--max-episode-steps", type=int, default=10_000)
     parser.add_argument("--frame-skip", type=int, default=1)
     parser.add_argument("--record-fps", type=float, default=0.0)
@@ -209,6 +211,7 @@ def resolve_model_config(args, checkpoint) -> dict:
         "shared_backbone": False,
         "frame_stack": 1,
         "normalize_obs": False,
+        "max_objects": 10,
     }
 
     if args.hidden_sizes:
@@ -221,6 +224,7 @@ def resolve_model_config(args, checkpoint) -> dict:
         config["shared_backbone"] = model_config.get("shared_backbone", False)
         config["frame_stack"] = model_config.get("frame_stack", 1)
         config["normalize_obs"] = model_config.get("normalize_obs", False)
+        config["max_objects"] = model_config.get("max_objects", 10)
 
     return config
 
@@ -249,15 +253,6 @@ def main() -> None:
 
     initial_seed = args.seed if args.seed is not None else random.randint(0, 1_000_000)
 
-    env = CracerGymEnv(
-        render_mode=render_mode,
-        obs_mode="state",
-        action_mode="discrete",
-        fps=args.env_fps,
-        seed=initial_seed,
-    )
-    obs, info = env.reset(seed=initial_seed)
-
     checkpoint_path = args.checkpoint
     if not os.path.isabs(checkpoint_path):
         checkpoint_path = os.path.join(ROOT, checkpoint_path)
@@ -267,6 +262,17 @@ def main() -> None:
 
     model_config = resolve_model_config(args, checkpoint)
     frame_stack_size = model_config.get("frame_stack", 1)
+    max_objects = model_config.get("max_objects", 10)
+
+    env = CracerGymEnv(
+        render_mode=render_mode,
+        obs_mode="state",
+        action_mode="discrete",
+        fps=args.env_fps,
+        seed=initial_seed,
+        max_objects=max_objects,
+    )
+    obs, info = env.reset(seed=initial_seed)
 
     normalize_obs = model_config.get("normalize_obs", False)
     print(f"Model config: hidden_sizes={model_config['hidden_sizes']}, "
@@ -303,77 +309,100 @@ def main() -> None:
     total_steps = []
     total_scores = []
     stages_reached = []
+    total_stages_cleared = 0  # cumulative across all episodes (for infinite mode)
 
     deterministic = not args.stochastic
+    infinite = args.infinite
+    max_episodes = args.episodes
+
     print(f"Action selection: {'deterministic' if deterministic else 'stochastic'}")
+    if infinite:
+        print("INFINITE MODE — press Ctrl+C to stop")
+    print()
 
-    for episode in range(1, args.episodes + 1):
-        # Use random seed for generalization testing
-        if args.random_seeds or args.seed is None:
-            episode_seed = random.randint(0, 1_000_000)
-        else:
-            episode_seed = args.seed
+    episode = 0
+    session_start = time.time()
 
-        obs, info = env.reset(seed=episode_seed)
-        obs = np.asarray(obs, dtype=np.float32)
+    try:
+        while True:
+            episode += 1
+            if not infinite and episode > max_episodes:
+                break
 
-        # Initialize frame stacker
-        if frame_stacker:
-            stacked_obs = frame_stacker.reset(obs)
-        else:
-            stacked_obs = obs
-
-        episode_reward = 0.0
-        episode_steps = 0
-        max_stage = 1
-
-        if writer:
-            frame = env.render()
-            if frame is not None:
-                writer.append_data(frame)
-
-        while episode_steps < args.max_episode_steps:
-            # Normalize observation if normalizer is available
-            obs_for_network = obs_normalizer.normalize(stacked_obs) if obs_normalizer else stacked_obs
-
-            with torch.no_grad():
-                obs_tensor = torch.tensor(obs_for_network, dtype=torch.float32, device=device).unsqueeze(0)
-                action = actor_critic.get_action(obs_tensor, deterministic=deterministic)
-
-            next_obs, reward, terminated, truncated, info = env.step(action)
-            next_obs = np.asarray(next_obs, dtype=np.float32)
-
-            # Update frame stacker
-            if frame_stacker:
-                stacked_obs = frame_stacker.push(next_obs)
+            if args.random_seeds or args.seed is None:
+                episode_seed = random.randint(0, 1_000_000)
             else:
-                stacked_obs = next_obs
+                episode_seed = args.seed
 
-            episode_reward += float(reward)
-            episode_steps += 1
+            obs, info = env.reset(seed=episode_seed)
+            obs = np.asarray(obs, dtype=np.float32)
 
-            current_stage = info.get("stage", 1)
-            max_stage = max(max_stage, current_stage)
+            if frame_stacker:
+                stacked_obs = frame_stacker.reset(obs)
+            else:
+                stacked_obs = obs
 
-            if writer and episode_steps % args.frame_skip == 0:
+            episode_reward = 0.0
+            episode_steps = 0
+            max_stage = 1
+
+            if writer:
                 frame = env.render()
                 if frame is not None:
                     writer.append_data(frame)
 
-            if args.render_live:
-                env.render()
+            while episode_steps < args.max_episode_steps:
+                obs_for_network = obs_normalizer.normalize(stacked_obs) if obs_normalizer else stacked_obs
 
-            if terminated or truncated:
-                break
+                with torch.no_grad():
+                    obs_tensor = torch.tensor(obs_for_network, dtype=torch.float32, device=device).unsqueeze(0)
+                    action = actor_critic.get_action(obs_tensor, deterministic=deterministic)
 
-        final_score = info.get("score", 0)
-        total_rewards.append(episode_reward)
-        total_steps.append(episode_steps)
-        total_scores.append(final_score)
-        stages_reached.append(max_stage)
+                next_obs, reward, terminated, truncated, info = env.step(action)
+                next_obs = np.asarray(next_obs, dtype=np.float32)
 
-        print(f"Episode {episode} (seed={episode_seed}): steps={episode_steps}, reward={episode_reward:.1f}, "
-              f"score={final_score:.0f}, stage={max_stage}")
+                if frame_stacker:
+                    stacked_obs = frame_stacker.push(next_obs)
+                else:
+                    stacked_obs = next_obs
+
+                episode_reward += float(reward)
+                episode_steps += 1
+                current_stage = info.get("stage", 1)
+                max_stage = max(max_stage, current_stage)
+
+                if writer and episode_steps % args.frame_skip == 0:
+                    frame = env.render()
+                    if frame is not None:
+                        writer.append_data(frame)
+
+                if args.render_live:
+                    env.render()
+
+                if terminated or truncated:
+                    break
+
+            final_score = info.get("score", 0)
+            stages_cleared_this_ep = max(0, max_stage - 1)
+            total_stages_cleared += stages_cleared_this_ep
+            total_rewards.append(episode_reward)
+            total_steps.append(episode_steps)
+            total_scores.append(final_score)
+            stages_reached.append(max_stage)
+
+            elapsed = time.time() - session_start
+            if infinite:
+                avg_stage = sum(stages_reached) / len(stages_reached)
+                print(f"Ep {episode:4d} | seed={episode_seed} | stage={max_stage} | "
+                      f"score={final_score:.0f} | avg_stage={avg_stage:.2f} | "
+                      f"total_stages_cleared={total_stages_cleared} | elapsed={elapsed:.0f}s")
+            else:
+                print(f"Episode {episode} (seed={episode_seed}): steps={episode_steps}, "
+                      f"reward={episode_reward:.1f}, score={final_score:.0f}, stage={max_stage}")
+
+    except KeyboardInterrupt:
+        if infinite:
+            print("\n--- Session ended by user ---")
 
     if writer:
         writer.close()
@@ -387,11 +416,14 @@ def main() -> None:
 
     print("-" * 60)
     print(f"Summary ({len(total_rewards)} episodes):")
-    print(f"  Mean reward: {mean_reward:.1f}")
-    print(f"  Mean score:  {mean_score:.0f}")
-    print(f"  Mean steps:  {mean_steps:.0f}")
-    print(f"  Mean stage:  {mean_stage:.1f}")
-    print(f"  Max stage:   {max_stage_reached}")
+    print(f"  Mean reward  : {mean_reward:.1f}")
+    print(f"  Mean score   : {mean_score:.0f}")
+    print(f"  Mean stage   : {mean_stage:.2f}")
+    print(f"  Best stage   : {max_stage_reached}")
+    if infinite:
+        elapsed = time.time() - session_start
+        print(f"  Total stages cleared: {total_stages_cleared}")
+        print(f"  Session duration    : {elapsed:.0f}s  ({elapsed/3600:.2f}h)")
 
     if output_path:
         print(f"  Video saved: {output_path}")

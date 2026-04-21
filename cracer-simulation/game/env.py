@@ -189,8 +189,8 @@ class CracerEnv:
         self.hazards = []
         self.lane_markers = []
 
-        # Clamp start_stage to valid range
-        start_stage = max(1, min(start_stage, 10))
+        # Clamp start_stage to valid range (extended to 30 for high-stage training)
+        start_stage = max(1, min(start_stage, 30))
 
         self.stage = start_stage
         self.score = 0.0
@@ -855,7 +855,7 @@ class CracerEnv:
 
         fuel_norm = max(0.0, min(1.0, self.fuel / self.max_fuel))
         distance_norm = max(0.0, min(1.0, self.distance_remaining / self._current_stage_distance()))
-        stage_norm = max(0.0, min(1.0, self.stage / 10.0))
+        stage_norm = max(0.0, self.stage / 10.0)  # No upper cap — allows stages 11+ to be observed
         lives_norm = max(0.0, min(1.0, self.lives / float(Config.starting_lives)))
 
         crashed_flag = 1.0 if self.game_mode == "crashed" else 0.0

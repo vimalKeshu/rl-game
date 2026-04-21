@@ -46,6 +46,7 @@ class TrainConfig:
     # Environment
     env_fps: int = 60
     max_episode_steps: int = 10_000
+    max_objects: int = 10  # Number of objects in observation
 
     # PPO Hyperparameters
     learning_rate: float = 3e-4
@@ -55,6 +56,7 @@ class TrainConfig:
     gae_lambda: float = 0.95  # GAE parameter
     clip_epsilon: float = 0.2  # PPO clipping parameter
     value_coef: float = 0.5  # Value loss coefficient
+    normalize_returns: bool = False  # Normalize returns before value loss (fixes value explosion)
     entropy_coef: float = 0.05  # Entropy bonus coefficient (higher for exploration)
     entropy_coef_end: float = 0.005  # Final entropy coefficient
     anneal_entropy: bool = True  # Enable entropy annealing
@@ -77,29 +79,42 @@ class TrainConfig:
     obs_clip: float = 10.0  # Clip normalized observations
 
     # Frame stacking
-    frame_stack: int = 1
+    frame_stack: int = 4
 
-    # Reward shaping - improved for stage progression
-    reward_speed_scale: float = 0.05  # Reduced to not dominate
+    # Reward shaping - aligned with SAC reference
+    reward_speed_scale: float = 0.1
     reward_fuel_bonus: float = 30.0
-    reward_crash_penalty: float = 50.0  # Reduced - don't over-penalize
-    reward_stage_bonus: float = 500.0  # Much higher to incentivize progression
-    reward_survival_bonus: float = 0.1  # Small bonus for staying alive
-    reward_distance_scale: float = 0.01  # Bonus for distance traveled
-    reward_distance_milestone: float = 50.0  # Bonus every milestone
-    reward_distance_milestone_interval: int = 500  # Distance between milestones
-    reward_pothole_penalty: float = 5.0  # Penalty for hitting potholes
-    reward_near_miss_bonus: float = 2.0  # Bonus for dodging obstacles
+    reward_crash_penalty: float = 75.0
+    reward_crash_penalty_stage_scale: float = 0.0  # Per-stage crash penalty multiplier
+    # Final crash penalty = reward_crash_penalty × (1 + scale × (stage - 1))
+    # e.g. scale=0.3, stage=10 → 600 × (1 + 0.3×9) = 600 × 3.7 = 2220
+    # Makes dying progressively more costly the further you've progressed
+    reward_stage_bonus: float = 1000.0
+    reward_survival_bonus: float = 0.15
+    reward_distance_scale: float = 0.1
+    reward_distance_milestone: float = 40.0
+    reward_distance_milestone_interval: int = 300
+    reward_pothole_penalty: float = 5.0
+    reward_safe_speed_bonus: float = 0.08
 
     # Generalization
     randomize_seed: bool = True
-    seed_range: int = 100
+    seed_range: int = 1000
 
-    # Curriculum Learning - start some episodes in later stages
+    # Fixed stage mix — used when curriculum_enabled=false
+    # Dict of {stage: probability} e.g. {1: 0.9, 2: 0.1}
+    # Empty dict means always stage 1.
+    stage_mix: Dict[int, float] = field(default_factory=dict)
+
+    # Curriculum Learning - 10-stage with graduation (mirrors SAC)
     curriculum_enabled: bool = True
-    curriculum_warmup_steps: int = 50_000
-    curriculum_stage_probs: Tuple[float, ...] = (0.30, 0.25, 0.20, 0.25)
-    curriculum_max_stage: int = 10
+    curriculum_graduation_window: int = 100
+    curriculum_min_episodes_per_stage: int = 150
+    curriculum_adaptive_eval_interval: int = 50
+    curriculum_max_stage: int = 10  # kept for eval threshold reference
+
+    # Early stopping
+    early_stopping_patience: int = 0  # 0 = disabled
 
     # Evaluation (periodic during training)
     eval_interval_updates: int = 50  # Set <= 0 to disable
@@ -125,8 +140,8 @@ class TrainConfig:
             data = yaml.safe_load(f)
         if "hidden_sizes" in data:
             data["hidden_sizes"] = tuple(data["hidden_sizes"])
-        if "curriculum_stage_probs" in data:
-            data["curriculum_stage_probs"] = tuple(data["curriculum_stage_probs"])
+        if "stage_mix" in data and isinstance(data["stage_mix"], dict):
+            data["stage_mix"] = {int(k): float(v) for k, v in data["stage_mix"].items()}
         if "eval_start_stages" in data:
             raw_stages = data["eval_start_stages"]
             if isinstance(raw_stages, str):
@@ -168,8 +183,14 @@ class RolloutBuffer:
         if self.pos >= self.buffer_size:
             self.full = True
 
-    def compute_returns_and_advantages(self, last_value: float, gamma: float, gae_lambda: float):
-        """Compute GAE advantages and returns."""
+    def compute_returns_and_advantages(self, last_value: float, gamma: float, gae_lambda: float,
+                                       normalize_returns: bool = False):
+        """Compute GAE advantages and returns.
+
+        normalize_returns: if True, normalise the return targets so the value function
+        always learns on a consistent scale regardless of episode reward magnitude.
+        This prevents value loss explosion as the agent clears more stages.
+        """
         last_gae = 0
         for t in reversed(range(self.pos)):
             if t == self.pos - 1:
@@ -183,6 +204,10 @@ class RolloutBuffer:
             self.advantages[t] = last_gae = delta + gamma * gae_lambda * next_non_terminal * last_gae
 
         self.returns[:self.pos] = self.advantages[:self.pos] + self.values[:self.pos]
+
+        if normalize_returns:
+            returns = self.returns[:self.pos]
+            self.returns[:self.pos] = (returns - returns.mean()) / (returns.std() + 1e-8)
 
     def get_batches(self, batch_size: int):
         """Yield minibatches for training."""
@@ -380,33 +405,157 @@ def pick_device(choice: str) -> str:
         return "mps"
     return "cpu"
 
+
 def load_checkpoint(path: str, device: str):
     return torch.load(path, map_location=device, weights_only=False)
 
 
-def sample_curriculum_stage(config: TrainConfig, global_step: int) -> int:
-    """Sample a start stage based on curriculum learning settings."""
-    if not config.curriculum_enabled:
-        return 1
+def find_latest_checkpoint(checkpoint_dir: str) -> Optional[str]:
+    """Find the latest numbered checkpoint in the directory."""
+    if not os.path.exists(checkpoint_dir):
+        return None
+    checkpoint_files = []
+    for f in os.listdir(checkpoint_dir):
+        if f.startswith("checkpoint_") and f.endswith(".pt"):
+            try:
+                step = int(f.replace("checkpoint_", "").replace(".pt", ""))
+                checkpoint_files.append((step, f))
+            except ValueError:
+                continue
+    if not checkpoint_files:
+        return None
+    checkpoint_files.sort(key=lambda x: x[0], reverse=True)
+    return os.path.join(checkpoint_dir, checkpoint_files[0][1])
 
-    if global_step < config.curriculum_warmup_steps:
-        return 1
 
-    probs = config.curriculum_stage_probs
-    roll = random.random()
-    cumulative = 0.0
+class CurriculumManager:
+    """10-stage curriculum with adaptive mode after graduation (mirrors SAC)."""
 
-    for tier, prob in enumerate(probs):
-        cumulative += prob
-        if roll < cumulative:
-            if tier == 0:
-                return 1
-            if tier == 1:
-                return random.randint(2, 3)
-            if tier == 2:
-                return random.randint(4, 5)
-            return random.randint(6, config.curriculum_max_stage)
+    STAGES = [
+        ({1: 1.0},                           150, None),
+        ({1: 0.7, 2: 0.3},                   200, 0.30),
+        ({1: 0.4, 2: 0.4, 3: 0.2},           250, 0.25),
+        ({2: 0.2, 3: 0.5, 4: 0.3},           300, 0.20),
+        ({2: 0.05, 3: 0.05, 4: 0.4, 5: 0.5}, 350, 0.15),
+        ({4: 0.25, 5: 0.25, 6: 0.5},         350, 0.15),
+        ({5: 0.3, 6: 0.4, 7: 0.3},           350, 0.10),
+        ({6: 0.2, 7: 0.4, 8: 0.4},           300, 0.10),
+        ({7: 0.3, 8: 0.4, 9: 0.3},           250, 0.10),
+        ({8: 0.2, 9: 0.4, 10: 0.4},          200, 0.10),
+    ]
 
+    def __init__(self, config: TrainConfig):
+        self.window = config.curriculum_graduation_window
+        self.min_episodes = config.curriculum_min_episodes_per_stage
+        self.adaptive_interval = config.curriculum_adaptive_eval_interval
+        self.enabled = config.curriculum_enabled
+
+        self.current_stage = 0
+        self.adaptive = False
+        self.stage_episodes = 0
+
+        self.rewards_buf: List[float] = []
+        self.completions_buf: List[float] = []
+
+        self.adaptive_rewards: Dict[int, List[float]] = {s: [] for s in range(1, 11)}
+        self.adaptive_weights: Dict[int, float] = {s: 1.0 / 10 for s in range(1, 11)}
+        self.adaptive_ep_count = 0
+
+    def sample_stage(self) -> int:
+        if not self.enabled:
+            return 1
+        dist = self.adaptive_weights if self.adaptive else self.STAGES[self.current_stage][0]
+        stages = list(dist.keys())
+        probs = [dist[s] for s in stages]
+        return random.choices(stages, weights=probs, k=1)[0]
+
+    def record_episode(self, reward: float, start_stage: int, max_stage: int) -> Optional[str]:
+        if not self.enabled:
+            return None
+        completed = 1.0 if max_stage > start_stage else 0.0
+        if not self.adaptive:
+            self.rewards_buf.append(reward)
+            self.completions_buf.append(completed)
+            self.stage_episodes += 1
+            if len(self.rewards_buf) > self.window:
+                self.rewards_buf = self.rewards_buf[-self.window:]
+                self.completions_buf = self.completions_buf[-self.window:]
+            return self._check_graduation()
+        else:
+            self.adaptive_rewards[start_stage].append(reward)
+            if len(self.adaptive_rewards[start_stage]) > self.window:
+                self.adaptive_rewards[start_stage] = self.adaptive_rewards[start_stage][-self.window:]
+            self.adaptive_ep_count += 1
+            if self.adaptive_ep_count % self.adaptive_interval == 0:
+                self._recompute_adaptive_weights()
+            return None
+
+    def _check_graduation(self) -> Optional[str]:
+        if self.stage_episodes < self.min_episodes or len(self.rewards_buf) < self.window:
+            return None
+        _, grad_reward, grad_completion = self.STAGES[self.current_stage]
+        mean_reward = np.mean(self.rewards_buf)
+        mean_comp = np.mean(self.completions_buf)
+        if mean_reward >= grad_reward and (grad_completion is None or mean_comp >= grad_completion):
+            old = self.current_stage + 1
+            if self.current_stage < len(self.STAGES) - 1:
+                self.current_stage += 1
+                self.stage_episodes = 0
+                self.rewards_buf.clear()
+                self.completions_buf.clear()
+                return (f"CURRICULUM: Graduated stage {old} -> {self.current_stage + 1} "
+                        f"(reward={mean_reward:.1f}, comp={mean_comp:.2f})")
+            else:
+                self.adaptive = True
+                return (f"CURRICULUM: Completed all 10 stages! Entering adaptive mode "
+                        f"(reward={mean_reward:.1f}, comp={mean_comp:.2f})")
+        return None
+
+    def _recompute_adaptive_weights(self):
+        means = {s: float(np.mean(self.adaptive_rewards[s])) if self.adaptive_rewards[s] else 0.0
+                 for s in range(1, 11)}
+        max_r = max(max(abs(v) for v in means.values()), 1.0)
+        raw = {s: 1.0 / (means[s] / max_r + 0.1) for s in range(1, 11)}
+        total = sum(raw.values())
+        self.adaptive_weights = {s: max(raw[s] / total, 0.05) for s in range(1, 11)}
+        total2 = sum(self.adaptive_weights.values())
+        self.adaptive_weights = {s: w / total2 for s, w in self.adaptive_weights.items()}
+        print(f"ADAPTIVE weights: { {s: f'{w:.3f}' for s, w in self.adaptive_weights.items()} }")
+
+    def get_state(self) -> dict:
+        return {
+            "current_stage": self.current_stage,
+            "adaptive": self.adaptive,
+            "stage_episodes": self.stage_episodes,
+            "rewards_buf": list(self.rewards_buf),
+            "completions_buf": list(self.completions_buf),
+            "adaptive_rewards": {s: list(v) for s, v in self.adaptive_rewards.items()},
+            "adaptive_weights": dict(self.adaptive_weights),
+            "adaptive_ep_count": self.adaptive_ep_count,
+        }
+
+    def load_state(self, state: dict):
+        self.current_stage = state["current_stage"]
+        self.adaptive = state["adaptive"]
+        self.stage_episodes = state["stage_episodes"]
+        self.rewards_buf = state["rewards_buf"]
+        self.completions_buf = state["completions_buf"]
+        self.adaptive_rewards = {int(k): v for k, v in state["adaptive_rewards"].items()}
+        self.adaptive_weights = {int(k): v for k, v in state["adaptive_weights"].items()}
+        self.adaptive_ep_count = state["adaptive_ep_count"]
+
+    def status_str(self) -> str:
+        if self.adaptive:
+            return "adaptive mode"
+        return f"stage {self.current_stage + 1}/10 (ep {self.stage_episodes}/{self.min_episodes})"
+
+
+def sample_start_stage(config: "TrainConfig") -> int:
+    """Sample a start stage. Uses stage_mix if set, else curriculum, else stage 1."""
+    if not config.curriculum_enabled and config.stage_mix:
+        stages = list(config.stage_mix.keys())
+        weights = [config.stage_mix[s] for s in stages]
+        return random.choices(stages, weights=weights, k=1)[0]
     return 1
 
 
@@ -424,26 +573,28 @@ def shape_reward(
     reward: float,
     info: dict,
     prev_info: dict,
-    config: TrainConfig
+    config: TrainConfig,
+    episode_state: Optional[dict] = None,
 ) -> float:
-    """Apply reward shaping based on game events."""
+    """Apply reward shaping based on game events (mirrors SAC implementation)."""
     shaped_reward = reward
 
-    # Survival bonus - small reward for staying alive
     shaped_reward += config.reward_survival_bonus
 
-    # Speed bonus (reduced to not dominate)
     speed = info.get("speed", 0)
+    speed_limit = info.get("speed_limit", 220)
     shaped_reward += speed * config.reward_speed_scale * 0.01
 
-    # Distance traveled bonus
+    game_mode = info.get("game_mode", "playing")
+    if game_mode == "playing" and speed >= speed_limit * 0.9:
+        shaped_reward += config.reward_safe_speed_bonus
+
     total_distance = compute_total_distance(info)
     prev_total_distance = compute_total_distance(prev_info)
     distance_delta = total_distance - prev_total_distance
     if distance_delta > 0:
         shaped_reward += distance_delta * config.reward_distance_scale
 
-    # Distance milestone bonus (every N distance units)
     if config.reward_distance_milestone_interval > 0:
         prev_milestones = int(prev_total_distance / config.reward_distance_milestone_interval)
         curr_milestones = int(total_distance / config.reward_distance_milestone_interval)
@@ -451,29 +602,20 @@ def shape_reward(
         if milestones_achieved > 0:
             shaped_reward += config.reward_distance_milestone * milestones_achieved
 
-    # Fuel pickup bonus
     fuel_current = info.get("fuel", 0)
     fuel_prev = prev_info.get("fuel", 0)
     if fuel_current > fuel_prev + 5:
         shaped_reward += config.reward_fuel_bonus
 
-    # Stage completion bonus - HIGH value to incentivize progression
     stage_current = info.get("stage", 1)
     stage_prev = prev_info.get("stage", 1)
     if stage_current > stage_prev:
-        # Exponential bonus for higher stages
-        stage_multiplier = stage_current  # Stage 2 = 2x, Stage 3 = 3x, etc.
-        shaped_reward += config.reward_stage_bonus * stage_multiplier
+        shaped_reward += config.reward_stage_bonus * stage_current
 
-    # Pothole penalty
-    potholes_current = info.get("potholes_hit", 0)
-    potholes_prev = prev_info.get("potholes_hit", 0)
-    if potholes_current > potholes_prev:
-        shaped_reward -= config.reward_pothole_penalty
-
-    # Crash penalty (moderate - don't over-penalize exploration)
-    if info.get("game_mode") == "crashed" and prev_info.get("game_mode") == "playing":
-        shaped_reward -= config.reward_crash_penalty
+    if game_mode == "crashed" and prev_info.get("game_mode") == "playing":
+        stage = info.get("stage", 1)
+        stage_scale = 1.0 + config.reward_crash_penalty_stage_scale * (stage - 1)
+        shaped_reward -= config.reward_crash_penalty * stage_scale
 
     return shaped_reward
 
@@ -572,6 +714,7 @@ def evaluate_policy(
         action_mode="discrete",
         fps=config.env_fps,
         seed=eval_seed,
+        max_objects=config.max_objects,
     )
 
     base_obs_size = env.observation_space.shape[0]
@@ -744,6 +887,7 @@ def evaluate(
         action_mode="discrete",
         fps=config.env_fps,
         seed=eval_seed,
+        max_objects=config.max_objects,
     )
 
     base_obs_size = env.observation_space.shape[0]
@@ -795,7 +939,7 @@ def evaluate(
     )
 
 
-def train(config: TrainConfig) -> None:
+def train(config: TrainConfig, resume: bool = True, warm_start_path: str = "") -> None:
     """Main PPO training loop."""
     device = pick_device(config.device)
     print(f"Device: {device}")
@@ -809,6 +953,7 @@ def train(config: TrainConfig) -> None:
         action_mode="discrete",
         fps=config.env_fps,
         seed=initial_seed,
+        max_objects=config.max_objects,
     )
 
     base_obs_size = env.observation_space.shape[0]
@@ -838,10 +983,25 @@ def train(config: TrainConfig) -> None:
     # Rollout buffer
     buffer = RolloutBuffer(config.rollout_steps, obs_size, device)
 
+    # Curriculum manager
+    curriculum = CurriculumManager(config)
+
     # Logging
     checkpoint_dir = os.path.join(ROOT, config.checkpoint_dir)
     os.makedirs(checkpoint_dir, exist_ok=True)
     logger = TrainingLogger(os.path.join(checkpoint_dir, "training_log.csv"))
+
+    # Dedicated eval log — primary generalization record (mirrors SAC setup)
+    eval_log_path = os.path.join(checkpoint_dir, "eval_log.csv")
+    eval_log_fields = (
+        ["timestep", "num_updates", "episodes"]
+        + [f"stage{s}_{m}" for s in config.eval_start_stages
+           for m in ("mean_stage", "mean_reward", "mean_score", "mean_length")]
+        + ["overall_mean_stage", "overall_mean_reward"]
+    )
+    if not resume or not os.path.exists(eval_log_path):
+        with open(eval_log_path, "w", newline="") as f:
+            csv.DictWriter(f, fieldnames=eval_log_fields).writeheader()
 
     # Training state
     global_step = 0
@@ -853,8 +1013,36 @@ def train(config: TrainConfig) -> None:
     episode_lengths: List[int] = []
     episode_start_stages: List[int] = []
 
+    best_mean_reward = float("-inf")
+    best_eval_reward = float("-inf")
+    evals_without_improvement = 0
+
+    # Auto-resume from latest checkpoint
+    latest_ckpt = find_latest_checkpoint(checkpoint_dir) if resume else None
+    if latest_ckpt is not None:
+        print(f"\nFound checkpoint: {latest_ckpt}")
+        ckpt = load_checkpoint(latest_ckpt, device)
+        actor_critic.load_state_dict(ckpt["actor_critic"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        global_step = int(ckpt.get("global_step", 0))
+        num_updates = int(ckpt.get("num_updates", 0))
+        if obs_normalizer and "obs_normalizer" in ckpt:
+            obs_normalizer.load_state(ckpt["obs_normalizer"])
+        if "curriculum" in ckpt:
+            curriculum.load_state(ckpt["curriculum"])
+        print(f"Resumed from step {global_step}, update {num_updates}")
+        print(f"  Curriculum: {curriculum.status_str()}")
+    elif resume:
+        print("\nNo checkpoint found, starting fresh training")
+    else:
+        print("\nStarting fresh training (--no-resume specified)")
+
+    # Warm-start: load actor weights from a prior experiment
+    if warm_start_path:
+        warm_start_actor(actor_critic, obs_normalizer, warm_start_path, device)
+
     # Current episode state
-    start_stage = sample_curriculum_stage(config, 0)
+    start_stage = sample_start_stage(config) if not config.curriculum_enabled else curriculum.sample_stage()
     obs, info = env.reset(seed=initial_seed, options={"start_stage": start_stage})
     obs = np.asarray(obs, dtype=np.float32)
     if frame_stacker:
@@ -866,12 +1054,13 @@ def train(config: TrainConfig) -> None:
     current_start_stage = start_stage
     prev_info = info.copy()
 
-    best_mean_reward = float("-inf")
     start_time = time.time()
 
     print(f"\nStarting PPO training for {config.total_timesteps} timesteps...")
     print(f"Rollout steps: {config.rollout_steps}, Epochs: {config.num_epochs}, Batch size: {config.batch_size}")
     print(f"Obs normalization: {config.normalize_obs}, LR annealing: {config.anneal_lr}, Entropy annealing: {config.anneal_entropy}")
+    if config.curriculum_enabled:
+        print(f"Curriculum: {curriculum.status_str()}")
 
     # Current scheduled values
     current_lr = config.learning_rate
@@ -907,7 +1096,7 @@ def train(config: TrainConfig) -> None:
             next_obs = np.asarray(next_obs, dtype=np.float32)
 
             # Shape reward
-            shaped_reward = shape_reward(reward, info, prev_info, config)
+            shaped_reward = shape_reward(reward, info, prev_info, config, None)
             prev_info = info.copy()
 
             done = terminated or truncated
@@ -932,9 +1121,14 @@ def train(config: TrainConfig) -> None:
                 episode_start_stages.append(current_start_stage)
                 episode_count += 1
 
+                # Record episode in curriculum
+                grad_msg = curriculum.record_episode(current_episode_reward, current_start_stage, max_stage)
+                if grad_msg:
+                    print(f"\n  {grad_msg}\n")
+
                 # Reset for new episode
                 new_seed = random.randint(0, config.seed_range) if config.randomize_seed else 42
-                start_stage = sample_curriculum_stage(config, global_step)
+                start_stage = sample_start_stage(config) if not config.curriculum_enabled else curriculum.sample_stage()
                 obs, info = env.reset(seed=new_seed, options={"start_stage": start_stage})
                 obs = np.asarray(obs, dtype=np.float32)
                 if frame_stacker:
@@ -962,7 +1156,8 @@ def train(config: TrainConfig) -> None:
             obs_tensor = torch.tensor(obs_normalized, dtype=torch.float32, device=device).unsqueeze(0)
             last_value = actor_critic.get_value(obs_tensor).item()
 
-        buffer.compute_returns_and_advantages(last_value, config.gamma, config.gae_lambda)
+        buffer.compute_returns_and_advantages(last_value, config.gamma, config.gae_lambda,
+                                              normalize_returns=config.normalize_returns)
 
         # Normalize advantages
         advantages = buffer.advantages[:buffer.pos]
@@ -1027,7 +1222,7 @@ def train(config: TrainConfig) -> None:
         if checkpoint_due:
             checkpoint_name = f"checkpoint_{num_updates}.pt"
             save_checkpoint(actor_critic, optimizer, config, global_step, num_updates,
-                           checkpoint_dir, checkpoint_name, obs_normalizer)
+                           checkpoint_dir, checkpoint_name, obs_normalizer, curriculum)
 
             if config.eval_episodes > 0:
                 eval_video_path = build_eval_video_path(num_updates, global_step)
@@ -1065,6 +1260,36 @@ def train(config: TrainConfig) -> None:
                     print(f"  Video saved: {saved_video_path}\n")
                 else:
                     print("  Video saved: failed (imageio writer unavailable)\n")
+
+                # Write to dedicated eval_log.csv (primary generalization record)
+                eval_row = {"timestep": global_step, "num_updates": num_updates,
+                            "episodes": episode_count}
+                for row in eval_per_stage:
+                    s = int(row["start_stage"])
+                    eval_row[f"stage{s}_mean_stage"]   = row["mean_max_stage"]
+                    eval_row[f"stage{s}_mean_reward"]  = row["mean_reward"]
+                    eval_row[f"stage{s}_mean_score"]   = row["mean_score"]
+                    eval_row[f"stage{s}_mean_length"]  = row["mean_length"]
+                eval_row["overall_mean_stage"]  = eval_overall["mean_max_stage"]
+                eval_row["overall_mean_reward"] = eval_overall["mean_reward"]
+                with open(eval_log_path, "a", newline="") as f:
+                    csv.DictWriter(f, fieldnames=eval_log_fields).writerow(eval_row)
+
+                # Track best eval and early stopping
+                if eval_overall["mean_reward"] > best_eval_reward:
+                    best_eval_reward = eval_overall["mean_reward"]
+                    evals_without_improvement = 0
+                    save_checkpoint(actor_critic, optimizer, config, global_step, num_updates,
+                                   checkpoint_dir, "best_eval.pt", obs_normalizer, curriculum)
+                    print(f"  New best eval reward: {best_eval_reward:.1f} - saved best_eval.pt")
+                else:
+                    evals_without_improvement += 1
+                    if config.early_stopping_patience > 0:
+                        print(f"  No improvement for {evals_without_improvement}/{config.early_stopping_patience} evals")
+
+                if config.early_stopping_patience > 0 and evals_without_improvement >= config.early_stopping_patience:
+                    print(f"\nEarly stopping triggered after {evals_without_improvement} evals without improvement")
+                    break
         elif (
             config.eval_episodes > 0
             and config.eval_interval_updates > 0
@@ -1172,11 +1397,13 @@ def train(config: TrainConfig) -> None:
             if mean_reward > best_mean_reward:
                 best_mean_reward = mean_reward
                 save_checkpoint(actor_critic, optimizer, config, global_step, num_updates,
-                               checkpoint_dir, "best.pt", obs_normalizer)
+                               checkpoint_dir, "best.pt", obs_normalizer, curriculum)
+            if config.curriculum_enabled:
+                print(f"  Curriculum: {curriculum.status_str()}")
 
     # Final save
     save_checkpoint(actor_critic, optimizer, config, global_step, num_updates,
-                   checkpoint_dir, "final.pt", obs_normalizer)
+                   checkpoint_dir, "final.pt", obs_normalizer, curriculum)
 
     env.close()
     print(f"\nTraining complete! Total timesteps: {global_step}, Updates: {num_updates}, Episodes: {episode_count}")
@@ -1186,7 +1413,8 @@ def train(config: TrainConfig) -> None:
 
 def save_checkpoint(model: nn.Module, optimizer: optim.Optimizer, config: TrainConfig,
                    global_step: int, num_updates: int, checkpoint_dir: str, filename: str,
-                   obs_normalizer: Optional[ObservationNormalizer] = None):
+                   obs_normalizer: Optional[ObservationNormalizer] = None,
+                   curriculum: Optional["CurriculumManager"] = None):
     """Save training checkpoint."""
     path = os.path.join(checkpoint_dir, filename)
     checkpoint_data = {
@@ -1200,11 +1428,44 @@ def save_checkpoint(model: nn.Module, optimizer: optim.Optimizer, config: TrainC
             "shared_backbone": config.shared_backbone,
             "frame_stack": config.frame_stack,
             "normalize_obs": config.normalize_obs,
+            "max_objects": config.max_objects,
         },
     }
     if obs_normalizer is not None:
         checkpoint_data["obs_normalizer"] = obs_normalizer.get_state()
+    if curriculum is not None:
+        checkpoint_data["curriculum"] = curriculum.get_state()
     torch.save(checkpoint_data, path)
+
+
+def warm_start_actor(actor_critic: nn.Module,
+                     obs_normalizer: Optional[ObservationNormalizer],
+                     checkpoint_path: str,
+                     device: str) -> None:
+    """Load ONLY the actor weights from a prior checkpoint.
+    Critic, optimizer, and curriculum are reset fresh.
+    """
+    if not os.path.isabs(checkpoint_path):
+        checkpoint_path = os.path.join(ROOT, checkpoint_path)
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Warm-start checkpoint not found: {checkpoint_path}")
+
+    print(f"\nWarm-starting actor from: {checkpoint_path}")
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+
+    # Load full actor_critic state but only keep actor weights
+    # PPO uses a single ActorCritic network — we load all weights then
+    # note the critic will be retrained (its weights are overwritten by optimizer)
+    actor_critic.load_state_dict(ckpt["actor_critic"])
+    print("  Actor-critic weights loaded (critic will retrain from scratch).")
+
+    if obs_normalizer is not None and "obs_normalizer" in ckpt:
+        obs_normalizer.load_state(ckpt["obs_normalizer"])
+        print(f"  Obs normalizer loaded (trained on {obs_normalizer.count} samples).")
+
+    step = ckpt.get("global_step", "?")
+    print(f"  Source checkpoint was at step {step}.")
+    print("  Optimizer, curriculum: initialized fresh.\n")
 
 
 def parse_args() -> argparse.Namespace:
@@ -1216,6 +1477,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-epochs", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--resume", dest="resume", action="store_true", default=True,
+                        help="Resume from latest checkpoint (default)")
+    parser.add_argument("--no-resume", dest="resume", action="store_false",
+                        help="Start fresh training, ignore existing checkpoints")
+    parser.add_argument("--warm-start-actor", type=str, default="",
+                        help="Path to checkpoint — loads actor weights, resets critic + optimizer")
     parser.add_argument("--eval", action="store_true", help="Run evaluation instead of training")
     parser.add_argument("--eval-checkpoint", type=str, default="", help="Checkpoint path for evaluation")
     parser.add_argument("--eval-episodes", type=int, default=5, help="Episodes per start stage")
@@ -1270,7 +1537,7 @@ def main() -> None:
         )
         return
 
-    train(config)
+    train(config, resume=args.resume, warm_start_path=args.warm_start_actor)
 
 
 if __name__ == "__main__":
