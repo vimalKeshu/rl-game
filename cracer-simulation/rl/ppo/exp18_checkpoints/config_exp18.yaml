@@ -1,0 +1,74 @@
+# Experiment 18 — "Fresh Training From Scratch"
+# No warm-start — random weights
+# Results: s1_best=4.2, s1_avg=3.52
+
+total_timesteps: 20000000
+max_episode_steps: 100000
+
+learning_rate: 0.0003
+learning_rate_end: 0.000005
+anneal_lr: true
+gamma: 0.99
+gae_lambda: 0.98
+clip_epsilon: 0.2
+value_coef: 0.5
+entropy_coef: 0.01
+entropy_coef_end: 0.001
+anneal_entropy: true
+max_grad_norm: 0.5
+normalize_returns: false
+
+rollout_steps: 4096
+num_epochs: 8
+batch_size: 64
+
+hidden_sizes:
+  - 512
+  - 512
+  - 512
+  - 256
+use_layer_norm: true
+shared_backbone: false
+
+normalize_obs: true
+obs_clip: 10.0
+frame_stack: 4
+max_objects: 10
+
+reward_crash_penalty: 600.0
+reward_crash_penalty_stage_scale: 0.4
+reward_survival_bonus: 0.2
+reward_distance_scale: 0.2
+reward_stage_bonus: 500.0
+reward_speed_scale: 0.1
+reward_fuel_bonus: 45.0
+reward_pothole_penalty: 8.0
+reward_distance_milestone: 40.0
+reward_distance_milestone_interval: 300
+reward_safe_speed_bonus: 0.08
+
+randomize_seed: true
+seed_range: 1000
+
+stage_mix:
+  1:  0.70
+  2:  0.20
+  3:  0.10
+
+curriculum_enabled: false
+early_stopping_patience: 0
+
+eval_interval_updates: 25
+eval_episodes: 10
+eval_start_stages:
+  - 1
+  - 3
+eval_deterministic: true
+eval_max_episode_steps: 100000
+
+log_interval: 1
+save_interval: 25
+checkpoint_dir: rl/ppo/checkpoints
+
+env_fps: 60
+device: cpu

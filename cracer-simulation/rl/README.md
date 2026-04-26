@@ -1,151 +1,209 @@
 # Reinforcement Learning Agents
 
-This folder contains three RL trainers for the `cracer_sim` Gymnasium wrapper:
+This folder contains RL trainers for the `cracer_sim` Gymnasium wrapper — a Road Fighter-style racing game where the agent must clear as many stages as possible from a cold start.
 
-| Algorithm | Type | Key Features |
-|-----------|------|--------------|
-| **DQN** | Off-policy, value-based | Dueling + Double DQN, Prioritized Experience Replay |
-| **PPO** | On-policy, policy gradient | LR annealing, observation normalization, curriculum learning |
-| **SAC** | Off-policy, actor-critic | Automatic entropy tuning, curriculum learning, adaptive eval |
+| Algorithm | Type | Best Result |
+|-----------|------|-------------|
+| **PPO** | On-policy, policy gradient | s1_best=8.6 (Exp27), actively being developed |
+| **SAC** | Off-policy, actor-critic | s1_best=2.20 (ceiling hit, moved to PPO) |
+| **DQN** | Off-policy, value-based | Baseline only |
 
-All three use `obs_mode="state"` and `action_mode="discrete"`.
+**Primary metric**: `stage1_mean_stage` — average stage reached when starting from stage 1 on unseen seeds, deterministic policy.
+
+---
 
 ## Install
 
-You need PyTorch in addition to the root requirements.
-
-```
+```bash
 pip install -r game/requirements.txt
 pip install -r rl/requirements.txt
 ```
 
-Then install PyTorch following the official instructions for your platform:
-
-https://pytorch.org/get-started/locally/
+Then install PyTorch for your platform: https://pytorch.org/get-started/locally/
 
 ---
 
-## DQN
+## PPO (Active)
 
-### Train
+PPO is the primary algorithm. It has gone through 27+ experiments progressively improving the agent from avg 2.1 → 8.6. See `rl/ppo/experiments.md` for the full experiment log.
 
-Edit `rl/dqn/config.yaml`, then run:
+### Quick start — run inference on a trained checkpoint
 
+Point at any experiment's `final.pt` or `best_eval.pt`:
+
+```bash
+# Watch the agent play live (Exp27 — best current model)
+python rl/ppo/infer_ppo.py \
+  --checkpoint rl/ppo/exp27_checkpoints/final.pt \
+  --render-live
+
+# Record a video
+python rl/ppo/infer_ppo.py \
+  --checkpoint rl/ppo/exp27_checkpoints/final.pt \
+  --output my_run.mp4 \
+  --episodes 3
+
+# Run 10 episodes and print stats
+python rl/ppo/infer_ppo.py \
+  --checkpoint rl/ppo/exp27_checkpoints/final.pt \
+  --episodes 10 \
+  --no-render
+
+# Run forever (infinite mode) — tracks cumulative stats
+python rl/ppo/infer_ppo.py \
+  --checkpoint rl/ppo/exp27_checkpoints/final.pt \
+  --infinite \
+  --render-live
 ```
-python rl/dqn/train_dqn.py --config rl/dqn/config.yaml
+
+**Checkpoint choice:**
+- `best_eval.pt` — highest eval score during training (best play quality, use for demos)
+- `final.pt` — last training step (may be slightly weaker than best_eval)
+
+The script reads `max_objects`, `hidden_sizes`, `frame_stack` etc. directly from the checkpoint — no manual config needed.
+
+### Available experiments
+
+Each experiment folder contains `final.pt`, `eval_log.csv`, `training_log.csv`, and a config YAML:
+
+| Folder | Key feature | s1_best |
+|--------|-------------|---------|
+| `exp18_checkpoints/` | Fresh training from scratch | 4.2 |
+| `exp19_checkpoints/` | Stage mix expanded to 1-6 | 7.4 |
+| `exp20_checkpoints/` | Stage mix expanded to 1-10 | 10.1 |
+| `exp21_checkpoints/` | Fuel exhaustion penalty | 10.4 |
+| `exp22_checkpoints/` | Stage-scaled bonuses | 11.3 |
+| `exp23_checkpoints/` | Stage mix expanded to 1-15 | 11.7 |
+| `exp24_checkpoints/` | Stage mix expanded to 1-20 | 11.8 |
+| `exp26_checkpoints/` | max_objects=30 + full-speed incentive (fresh) | 7.0 |
+| `exp27_checkpoints/` | Stage mix 1-6 on max_objects=30 chain | **8.6** |
+
+### Train from scratch
+
+```bash
+# Edit the config then run
+python rl/ppo/train_ppo.py --config rl/ppo/config.yaml --no-resume
 ```
 
-Checkpoints are saved to `rl/dqn/checkpoints/`.
+### Warm-start from an existing checkpoint
 
-### Resume
+```bash
+# Load actor weights from a prior experiment, reset critic/optimizer
+python rl/ppo/train_ppo.py \
+  --config rl/ppo/config.yaml \
+  --warm-start-actor rl/ppo/exp27_checkpoints/final.pt \
+  --no-resume
+```
 
-Set `resume` in `rl/dqn/config.yaml`:
+### Resume an interrupted run
+
+```bash
+# Auto-resumes from latest checkpoint_N.pt in checkpoint_dir
+python rl/ppo/train_ppo.py --config rl/ppo/config.yaml --resume
+```
+
+### Override config values from CLI
+
+```bash
+python rl/ppo/train_ppo.py \
+  --config rl/ppo/config.yaml \
+  --total-timesteps 5000000 \
+  --learning-rate 0.0001
+```
+
+### Key config parameters explained
 
 ```yaml
-resume: "rl/dqn/checkpoints/episode_500.pt"
+total_timesteps: 20000000     # Total environment steps
+max_episode_steps: 100000     # Never cut off a live agent (set high)
+max_objects: 30               # Objects visible in observation (30 = full awareness)
+frame_stack: 4                # Stacked frames for temporal context
+
+# Stage mix — probability of starting each episode at that stage
+# Heavy stage-1 for fresh training; expand as agent improves
+stage_mix:
+  1: 0.70   # cold-start anchor
+  2: 0.20
+  3: 0.10
+
+# Reward signals
+reward_crash_penalty: 600.0              # flat crash cost
+reward_crash_penalty_stage_scale: 0.4   # scales crash cost by stage (stage 10 = 2760)
+reward_fuel_exhaustion_penalty: 600.0   # dying from fuel = same as a crash
+reward_low_fuel_penalty: 2.0            # per-step urgency when fuel < 30
+reward_bonus_stage_scale: 0.3           # scales survival/fuel/milestone bonuses by stage
+reward_speed_scale: 0.5                 # incentivize holding max speed
+
+# Eval settings
+eval_start_stages: [1, 5, 10]  # evaluate cold-start and mid-game
+eval_episodes: 10              # per start stage
+eval_max_episode_steps: 100000 # never cut off eval episodes
 ```
 
-### Debug Render
+### Starting a new experiment (recommended workflow)
 
-Set `render: true` and lower `total_episodes` in `rl/dqn/config.yaml`.
+1. Copy the latest config as your base:
+   ```bash
+   cp rl/ppo/exp27_checkpoints/config_exp27.yaml rl/ppo/config.yaml
+   ```
+2. Edit `config.yaml` with your changes
+3. Run with warm-start from the latest best checkpoint:
+   ```bash
+   python rl/ppo/train_ppo.py \
+     --config rl/ppo/config.yaml \
+     --warm-start-actor rl/ppo/checkpoints/best_eval.pt \
+     --no-resume
+   ```
+4. Monitor progress in `rl/ppo/checkpoints/eval_log.csv`
+5. After completion, archive:
+   ```bash
+   mkdir rl/ppo/expN_checkpoints
+   mv rl/ppo/checkpoints/final.pt \
+      rl/ppo/checkpoints/eval_log.csv \
+      rl/ppo/checkpoints/training_log.csv \
+      rl/ppo/expN_checkpoints/
+   cp rl/ppo/config.yaml rl/ppo/expN_checkpoints/config_expN.yaml
+   ```
 
-### Inference + Video
+### Experiment log
 
-```
-python rl/dqn/infer_dqn.py --checkpoint rl/dqn/checkpoints/best.pt --episodes 1
-```
-
-Options: `--output`, `--frame-skip`, `--render-live`, `--random-seeds`, `--seed`, `--no-render`.
-
-### Notes
-
-- Uses Dueling + Double DQN with optional Prioritized Experience Replay.
-- Tune exploration with `eps_start`, `eps_end`, and `eps_decay`.
-- Reward shaping is configurable via `reward_*` keys in the config.
-- Set `randomize_seed: true` and `seed_range` for generalization across map seeds.
+See `rl/ppo/experiments.md` for the full history of all 27 experiments — hypothesis, config, results, and key learnings for each.
 
 ---
 
-## PPO
+## SAC (Reference)
+
+SAC was the original algorithm. It hit a ceiling of ~2.20 avg stage after 5 experiments due to off-policy replay buffer incompatibility with sequential skill-building. Moved to PPO.
 
 ### Train
 
-Edit `rl/ppo/config.yaml`, then run:
-
-```
-python rl/ppo/train_ppo.py --config rl/ppo/config.yaml
-```
-
-Checkpoints are saved to `rl/ppo/checkpoints/`.
-
-Override config values from the command line:
-
-```
-python rl/ppo/train_ppo.py --config rl/ppo/config.yaml --total-timesteps 500000 --learning-rate 0.001
-```
-
-### Evaluation
-
-Run evaluation on a trained checkpoint:
-
-```
-python rl/ppo/train_ppo.py --eval --eval-checkpoint rl/ppo/checkpoints/best.pt --eval-episodes 5 --eval-start-stages 8-10,12
-```
-
-### Inference + Video
-
-```
-python rl/ppo/infer_ppo.py --checkpoint rl/ppo/checkpoints/best.pt --episodes 1
-```
-
-Options: `--output`, `--frame-skip`, `--render-live`, `--random-seeds`, `--seed`, `--stochastic`, `--no-render`.
-
-### Notes
-
-- Supports learning rate annealing (`anneal_lr`) and entropy coefficient annealing (`anneal_entropy`).
-- Observation normalization via `normalize_obs`.
-- Frame stacking controlled by `frame_stack` (default 4).
-- Curriculum learning gradually exposes the agent to harder stages (`curriculum_enabled`).
-- Periodic evaluation during training (`eval_interval_updates`).
-
----
-
-## SAC
-
-### Train
-
-Edit `rl/sac/config.yaml`, then run:
-
-```
+```bash
 python rl/sac/train_sac.py --config rl/sac/config.yaml
 ```
 
-Checkpoints are saved to `rl/sac/checkpoints/`.
+Auto-resumes from latest checkpoint. Use `--no-resume` to start fresh.
 
-Training automatically resumes from the latest checkpoint if one exists. Use `--no-resume` to start fresh.
+### Inference
 
-Override config values from the command line:
-
-```
-python rl/sac/train_sac.py --config rl/sac/config.yaml --total-timesteps 1000000 --batch-size 128
+```bash
+python rl/sac/infer_sac.py --checkpoint rl/sac/checkpoints/best.pt --episodes 3
 ```
 
-### Inference + Video
+---
 
+## DQN (Baseline)
+
+### Train
+
+```bash
+python rl/dqn/train_dqn.py --config rl/dqn/config.yaml
 ```
-python rl/sac/infer_sac.py --checkpoint rl/sac/checkpoints/best.pt --episodes 1
+
+### Inference
+
+```bash
+python rl/dqn/infer_dqn.py --checkpoint rl/dqn/checkpoints/best.pt --episodes 1
 ```
-
-Options: `--output`, `--frame-skip`, `--render-live`, `--random-seeds`, `--seed`, `--stochastic`, `--no-render`.
-
-### Notes
-
-- Automatic entropy tuning (`auto_alpha: true`) with configurable `target_entropy_ratio` and `min_alpha`.
-- Adaptive curriculum learning with graduation windows and per-stage episode minimums.
-- Frame stacking controlled by `frame_stack` (default 4).
-- Observation normalization via `normalize_obs`.
-- Early stopping support (`early_stopping_patience`).
-- Evaluation runs after each checkpoint save (`eval_episodes`).
 
 ---
 
@@ -155,21 +213,24 @@ Options: `--output`, `--frame-skip`, `--render-live`, `--random-seeds`, `--seed`
 rl/
 ├── README.md
 ├── requirements.txt
-├── test.py
 ├── dqn/
 │   ├── config.yaml
 │   ├── train_dqn.py
-│   ├── infer_dqn.py
-│   ├── plot_training.py
-│   └── checkpoints/
+│   └── infer_dqn.py
 ├── ppo/
-│   ├── config.yaml
+│   ├── config.yaml               ← current experiment config
 │   ├── train_ppo.py
 │   ├── infer_ppo.py
-│   └── checkpoints/
+│   ├── experiments.md            ← full experiment log (27 experiments)
+│   ├── merge_policies.py
+│   ├── checkpoints/              ← active training output
+│   │   └── best_eval.pt          ← use this for next warm-start
+│   ├── exp18_checkpoints/        ← archived experiments
+│   ├── exp19_checkpoints/
+│   ├── ...
+│   └── exp27_checkpoints/
 └── sac/
     ├── config.yaml
     ├── train_sac.py
-    ├── infer_sac.py
-    └── checkpoints/
+    └── infer_sac.py
 ```
