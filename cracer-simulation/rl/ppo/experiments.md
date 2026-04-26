@@ -388,4 +388,213 @@
   robustness rather than inheriting a saturated lineage. After this run we can warm-start
   Exp19 with a legitimately earned foundation and expand the stage mix.
 - **Target**: s1_avg(last10) > 3.5 at 10M steps, > 5.0 at 20M steps
+- **Final results** (20M steps, 4883 updates, 15969 episodes):
+  - s1_best=4.2  |  s1_avg(last10)=3.52  |  s3_avg(last10)=4.0
+  - Final entropy=0.98 (policy not fully converged — still learning at end)
+  - Final LR=5e-6, training mean_stage=3.4
+  - Tracks above Exp1 trajectory with better reward structure
+  - Foundation genuinely earned — ready for Exp19 expansion
+- **Status**: COMPLETED
+
+---
+
+## Experiment 19: "Expand Stage Mix to 1-6" (RUNNING)
+- **Date**: 2026-04-21  |  Warm-start: Exp18 best_eval.pt (s1_avg=3.52, entropy=0.98)
+- **Hypothesis**: Exp18 built a genuine cold-start foundation from scratch.
+  Expanding the stage mix to stages 1-6 (vs 1-3 in Exp18) will teach the agent
+  to chain through higher stages while preserving the cold-start robustness.
+  With 45% stage-1 anchor and graduated coverage to stage 6, expect s1_avg > 5.0.
+- **Changes from Exp18**:
+  - learning_rate: 3e-4 → 1e-4  (more mature policy, lower starting LR)
+  - learning_rate_end: 5e-6 → 2e-6
+  - entropy_coef: 0.01 → 0.005  (Exp18 ended at 0.98 — keep some exploration)
+  - entropy_coef_end: 0.001 → 0.0005
+  - value_coef: 0.5 → 0.15  (policy more mature, critic needs less correction)
+  - stage_mix: {1:0.45, 2:0.20, 3:0.15, 4:0.10, 5:0.07, 6:0.03}
+  - eval_start_stages: [1, 3, 5]  (added stage-5 eval)
+- **Target**: s1_avg(last10) > 5.0, s5_avg > 6.0 at 20M steps
+- **Final results** (20M steps, 4883 updates, 8620 episodes):
+  - s1_best=**7.4**  |  s1_avg(last10)=**6.03**  |  s5_avg(last10)=~6.9
+  - **New record** — broke the 5.25 plateau that held for Exps 9-17
+  - Fresh foundation (Exp18) was the key — Exp19 proved it by exceeding old ceiling
+- **Status**: COMPLETED
+
+---
+
+## Experiment 20: "Expand Stage Mix to 1-10" (RUNNING)
+- **Date**: 2026-04-22  |  Warm-start: Exp19 best_eval.pt (s1_best=7.4, s1_avg=6.03)
+- **Hypothesis**: Exp19 mastered stages 1-6 (s1_avg=6.03, new record). Expanding stage
+  mix to stages 1-10 will push the agent into consistently clearing stage 10+ while
+  maintaining cold-start robustness via 35% stage-1 anchor.
+- **Changes from Exp19**:
+  - learning_rate: 1e-4 → 5e-5  (more mature policy)
+  - learning_rate_end: 2e-6 → 1e-6
+  - entropy_coef: 0.005 → 0.003
+  - entropy_coef_end: 0.0005 → 0.0003
+  - value_coef: 0.15 → 0.10
+  - stage_mix: expanded to {1:0.35, 2:0.15, 3:0.12, 4:0.10, 5:0.09, 6:0.08, 7:0.05, 8:0.03, 9:0.02, 10:0.01}
+  - total_timesteps: 20M → 25M  (wider stage range needs more budget)
+  - eval_start_stages: [1, 5, 8]  (added stage-8 eval back)
+- **Target**: s1_avg(last10) > 7.0, s1_best > 10.0, agent reaching stage 13+
+- **Final results** (25M steps, 6104 updates, 6884 episodes):
+  - s1_best=**10.1**  |  s1_avg(last10)=**8.46**  |  s8_best=10.2
+  - Training mean_stage=7.47, final entropy=0.93
+  - New record — agent clearing 8-10 stages from cold start
+  - Observed issue: agent plays great without losing lives but dies from fuel exhaustion
+    at high stages — fuel has no penalty signal, agent never learned fuel = life
+- **Status**: COMPLETED
+
+---
+
+## Experiment 21: "Fuel Awareness" (RUNNING)
+- **Date**: 2026-04-22  |  Warm-start: Exp20 best_eval.pt (s1_best=10.1, s1_avg=8.46)
+- **Problem**: Agent dies from fuel exhaustion at high stages (stage 13-14) despite
+  having lives remaining. Fuel pickup reward (45 pts) is 13x weaker than crash penalty
+  (600 pts). No penalty for dying from empty fuel → agent never prioritized fuel.
+- **Two new reward signals** (added to train_ppo.py shape_reward):
+  1. reward_fuel_exhaustion_penalty=600: dying from fuel = same cost as a crash (stage-scaled)
+     Makes fuel exhaustion a first-class concern equal to crashing
+  2. reward_low_fuel_penalty=2.0: per-step penalty when fuel < 30
+     Continuous urgency gradient — lower fuel = higher per-step cost
+     Pushes agent to seek pickups proactively before running dry
+- **Everything else identical to Exp20** — isolate the fuel signal change
+- **Target**: agent survives longer at stages 13+ by actively collecting fuel,
+  s1_best > 12.0, s1_avg(last10) > 9.0
+- **Final results** (killed at ~10.5M steps):
+  - s1_best=10.4  |  s8_best=11.4  |  episode lengths 7000–8600 (vs Exp20's 4600)
+  - Fuel awareness confirmed working — agent surviving significantly longer per episode
+- **Status**: KILLED at 10.5M — proceeding to Exp22
+
+---
+
+## Experiment 22: "Stage-Scaled Bonuses (Symmetric Risk-Reward)" (RUNNING)
+- **Date**: 2026-04-22  |  Warm-start: Exp21 best_eval.pt
+- **Insight**: Penalties scale with stage (crash/fuel exhaustion cost more at high stages)
+  but bonuses were flat. Surviving at stage 10 paid the same per step as stage 1.
+  Asymmetric incentive: agent avoids death but has no proportionally stronger reason
+  to fight to stay alive at high stages.
+- **New config param**: reward_bonus_stage_scale=0.3
+  bonus_multiplier = 1 + 0.3 × (stage - 1)
+  Applies to: survival_bonus, fuel_pickup_bonus, distance_milestone
+  Stage 5: ×2.2  |  Stage 10: ×3.7  |  Stage 15: ×5.2
+- **Effect**: symmetric risk-reward landscape
+  - Dying at stage 10: costs 2760 pts (crash penalty, unchanged)
+  - Surviving each step at stage 10: earns 0.74 pts (was 0.2)
+  - Fuel pickup at stage 10: earns 166 pts (was 45) — strong incentive to seek fuel
+- **Everything else identical to Exp21**
+- **Target**: s1_best > 14, s1_avg(last10) > 10.0, agent surviving stage 15+
+- **Final results** (25M steps, completed):
+  - s1_best=**11.3**  |  s1_avg(last10)=**8.89**  |  top5=[10.6,10.7,10.9,10.9,11.3]
+  - Stage-scaled bonuses confirmed effective — agent pushes deeper into high stages
+- **Status**: COMPLETED
+
+---
+
+## Experiment 23: "Expand Stage Mix to 1-15" (RUNNING)
+- **Date**: 2026-04-23  |  Warm-start: Exp22 best_eval.pt (s1_best=11.3, s1_avg=8.89)
+- **Hypothesis**: Exp22 agent consistently reaches stage 10-11 from cold start but
+  stage mix only went to stage 10 — no direct training on stages 11-15.
+  Expanding to stages 1-15 gives explicit practice on territory already reached,
+  which should consolidate performance and push best runs to stage 14-15+.
+- **Changes from Exp22**:
+  - stage_mix: expanded to stages 1-15, stage-1 anchor reduced to 25%
+  - learning_rate: 2e-5 → 1e-5  (more mature policy)
+  - learning_rate_end: 3e-7 → 2e-7
+  - eval_start_stages: [1, 5, 10]  (stage-10 eval replaces stage-8)
+- **All reward signals identical to Exp22** (fuel exhaustion + stage-scaled bonuses)
+- **Target**: s1_best > 14, s1_avg(last10) > 10.0, agent reliably reaching stage 15+
+- **Final results** (25M steps, completed):
+  - s1_best=**11.7**  |  s1_avg(last10)=~9.5  |  s10_best=13.1
+  - Top 5 s1: [10.8, 11.0, 11.3, 11.5, 11.7]
+  - Steady improvement — expanding stage mix to 1-15 pushed best from 11.3 → 11.7
+- **Status**: COMPLETED
+
+---
+
+## Experiment 24: "Expand Stage Mix to 1-20" (RUNNING)
+- **Date**: 2026-04-24  |  Warm-start: Exp23 best_eval.pt (s1_best=11.7, s1_avg~9.5)
+- **Hypothesis**: Exp23 agent reaches stage 11-13 but stage mix only went to 15.
+  Expanding to stages 1-20 gives direct practice on the new frontier.
+  Stage-1 anchor reduced to 20% (cold-start mastery well established).
+- **Changes from Exp23**:
+  - stage_mix: expanded to stages 1-20, stage-1 anchor 25% → 20%
+  - learning_rate: 1e-5 → 8e-6
+  - learning_rate_end: 2e-7 → 1e-7
+- **All reward signals identical to Exp22/23**
+- **Target**: s1_best > 14, s1_avg(last10) > 10.5, agent reaching stage 17+
+- **Final results** (25M steps, completed):
+  - s1_best=**11.8**  |  s1_avg(last10)=8.97  |  s10_best=14.7
+  - Marginal gain (+0.1) over Exp23 — stage mix expansion to 1-20 hit diminishing returns
+  - Root cause diagnosed: observation blindness — max_objects=10 misses enemies/fuel at stage 15+
+  - Training mean_stage=11.24 (highest ever) but can't translate to higher cold-start scores
+- **Status**: COMPLETED
+
+---
+
+## Experiment 25: "Fresh Training — max_objects=30" (RUNNING)
+- **Date**: 2026-04-24  |  **No warm-start — random weights**
+- **Core change**: max_objects: 10 → 30
+  obs_size: 364 → 1004 (incompatible with old weights — must train fresh)
+- **Why max_objects=30**:
+  - At stage 15+, road has 20+ objects but agent only saw 10 nearest
+  - Missed fuel pickups = ran out of fuel with fuel visible ahead
+  - Collided with "invisible" enemy #11 that old network couldn't see
+  - max_objects=30 gives full situational awareness at all stages
+- **Fresh training strategy** (mirrors successful Exp18):
+  - Random weight init, LR=3e-4, entropy=0.01
+  - Heavy stage-1 focus: {1:0.70, 2:0.20, 3:0.10}
+  - 30M steps (extra budget for larger obs space)
+  - All proven rewards kept (crash penalty, fuel exhaustion, stage-scaled bonuses)
+- **Plan after this**: warm-start Exp26 with expanded stage mix (same path as Exp18→19→20→21→22→23→24)
+- **Target**: match Exp18 trajectory — s1_avg > 3.5 at 10M, > 5.0 at 20M, then Exp26+ surpasses old ceiling
+- **Final results** (killed at 2.0M steps — only 6.7% through):
+  - s1_best=1.6  |  still in early learning phase
+  - Killed early to run Exp26 (full-speed incentive) using Exp25's best_eval.pt as weak warm-start
+- **Status**: KILLED at 2.0M
+
+---
+
+## Experiment 26: "Expand Stage Mix 1-6 + Full-Speed Incentive" (RUNNING)
+- **Date**: 2026-04-24  |  Warm-start: Exp25 best_eval.pt (max_objects=30, s1_avg=1.6 — weak but compatible)
+- **Two changes from Exp25**:
+  1. stage_mix: {1:0.45, 2:0.20, 3:0.15, 4:0.10, 5:0.07, 6:0.03}
+  2. reward_speed_scale: 0.1 → 0.5 — full-speed incentive
+     At max speed 360: 1.8/step (was 0.36). Stage-scaled at stage 10: 6.66/step
+     Agent incentivized to hold max throttle rather than drift with speed zones
+- **Note**: started fresh (no warm-start) — cleaner foundation, high LR=3e-4, entropy=0.01
+  stage_mix: {1:0.70, 2:0.20, 3:0.10}, 30M steps
+- **Target**: s1_avg > 5.0, agent visibly playing at full speed at high stages
+- **Status**: RUNNING
+
+---
+
+## Experiment 26: "Expand Stage Mix 1-6 + Full-Speed Incentive" (PENDING — awaiting Exp25)
+- **Warm-start**: Exp25 best_eval.pt (max_objects=30 foundation)
+- **Two changes from Exp25**:
+  1. stage_mix expanded to {1:0.45, 2:0.20, 3:0.15, 4:0.10, 5:0.07, 6:0.03}
+     Same graduated expansion that took Exp18→Exp19 from avg 3.52 → 6.03
+  2. reward_speed_scale: 0.1 → 0.5 (full-speed incentive)
+     At max speed 360: 1.8/step (was 0.36/step)
+     Stage-scaled: at stage 10 → 6.66/step for holding max speed
+     Agent now has real incentive to push full throttle, not drift with speed zones
+     Faster stage completion = less time exposed to enemies = fewer crashes
+- **Final results** (30M steps, completed):
+  - s1_best=**7.0**  |  s1_avg(last10)=**5.63**  |  final entropy=1.04
+  - 67% stronger foundation than Exp18 (was 3.52 avg) — max_objects=30 + speed_scale=0.5
+- **Status**: COMPLETED
+
+---
+
+## Experiment 27: "Expand Stage Mix 1-6" (RUNNING)
+- **Date**: 2026-04-25  |  Warm-start: Exp26 best_eval.pt (s1_best=7.0, s1_avg=5.63)
+- **Same move as Exp18→Exp19**: expand stage mix from {1-3} to {1-6}
+  Exp18→Exp19 took avg 3.52 → 6.03. With stronger Exp26 foundation, expect > 8.0.
+- **Changes from Exp26**:
+  - learning_rate: 3e-4 → 1e-4 (more mature policy)
+  - entropy_coef: 0.01 → 0.005
+  - value_coef: 0.5 → 0.15
+  - stage_mix: {1:0.45, 2:0.20, 3:0.15, 4:0.10, 5:0.07, 6:0.03}
+  - total_timesteps: 30M → 20M
+- **All other settings identical to Exp26** (max_objects=30, speed_scale=0.5, full reward stack)
+- **Target**: s1_avg(last10) > 8.0, s1_best > 10.0
 - **Status**: RUNNING

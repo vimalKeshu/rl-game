@@ -1,0 +1,99 @@
+# PPO Training Configuration — Experiment 26
+#
+# Warm-start from Exp25 (max_objects=30 fresh foundation)
+#
+# Two improvements over the Exp18→19→20 path:
+#
+# 1. Expand stage mix to 1-6 (same as Exp19 did for Exp18)
+#    Exp25 trains only on stages 1-3. Exp26 expands to 1-6 to build chaining skill.
+#
+# 2. Full-speed incentive (new)
+#    Current reward_speed_scale=0.1 → speed * 0.001/step
+#    At max speed 360: only 0.36/step — too weak to motivate full throttle
+#    Raising to 0.5 → speed * 0.005/step = 1.8/step at max speed
+#    This incentivizes the agent to push toward max_speed always,
+#    not just drift with speed zones. At high stages, aggressive speed
+#    means faster stage completion and less time exposed to enemies.
+#    Stage-scaled bonus (0.3) means at stage 10: 1.8 * 3.7 = 6.66/step
+#    for holding max speed — a real incentive to go fast.
+
+total_timesteps: 30000000
+max_episode_steps: 100000
+
+learning_rate: 0.0003
+learning_rate_end: 0.000005
+anneal_lr: true
+gamma: 0.99
+gae_lambda: 0.98
+clip_epsilon: 0.2
+value_coef: 0.5
+entropy_coef: 0.01
+entropy_coef_end: 0.001
+anneal_entropy: true
+max_grad_norm: 0.5
+normalize_returns: false
+
+rollout_steps: 4096
+num_epochs: 8
+batch_size: 64
+
+hidden_sizes:
+  - 512
+  - 512
+  - 512
+  - 256
+use_layer_norm: true
+shared_backbone: false
+
+normalize_obs: true
+obs_clip: 10.0
+frame_stack: 4
+max_objects: 30   # matches Exp25
+
+# Full proven reward stack
+reward_crash_penalty: 600.0
+reward_crash_penalty_stage_scale: 0.4
+reward_fuel_exhaustion_penalty: 600.0
+reward_low_fuel_penalty: 2.0
+reward_survival_bonus: 0.2
+reward_distance_scale: 0.2
+reward_stage_bonus: 500.0
+reward_pothole_penalty: 8.0
+reward_fuel_bonus: 45.0
+reward_distance_milestone: 40.0
+reward_distance_milestone_interval: 300
+reward_safe_speed_bonus: 0.08
+reward_bonus_stage_scale: 0.3
+
+# KEY CHANGE: full-speed incentive
+# 0.1 → 0.5: at max speed 360 → 1.8/step (was 0.36/step)
+# Stage-scaled: at stage 10 → 6.66/step for holding max speed
+reward_speed_scale: 0.5
+
+randomize_seed: true
+seed_range: 1000
+
+# Heavy stage-1 focus — fresh policy must earn cold-start from scratch
+stage_mix:
+  1:  0.70
+  2:  0.20
+  3:  0.10
+
+curriculum_enabled: false
+early_stopping_patience: 0
+
+eval_interval_updates: 25
+eval_episodes: 10
+eval_start_stages:
+  - 1
+  - 3
+  - 5
+eval_deterministic: true
+eval_max_episode_steps: 100000
+
+log_interval: 1
+save_interval: 25
+checkpoint_dir: rl/ppo/checkpoints
+
+env_fps: 60
+device: cpu

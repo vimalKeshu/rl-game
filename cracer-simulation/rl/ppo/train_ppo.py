@@ -96,6 +96,12 @@ class TrainConfig:
     reward_distance_milestone_interval: int = 300
     reward_pothole_penalty: float = 5.0
     reward_safe_speed_bonus: float = 0.08
+    reward_fuel_exhaustion_penalty: float = 0.0   # penalty on death by fuel (mirrors crash penalty)
+    reward_low_fuel_penalty: float = 0.0          # per-step penalty when fuel < 30 (urgency signal)
+    reward_bonus_stage_scale: float = 0.0         # scale bonuses proportionally to stage progress
+    # Final bonus = base × (1 + scale × (stage - 1))
+    # e.g. scale=0.3, stage=10 → survival/fuel/milestone bonus × 3.7
+    # Symmetric with crash penalty — surviving at high stages pays more too
 
     # Generalization
     randomize_seed: bool = True
@@ -579,7 +585,10 @@ def shape_reward(
     """Apply reward shaping based on game events (mirrors SAC implementation)."""
     shaped_reward = reward
 
-    shaped_reward += config.reward_survival_bonus
+    stage = info.get("stage", 1)
+    bonus_scale = 1.0 + config.reward_bonus_stage_scale * (stage - 1)
+
+    shaped_reward += config.reward_survival_bonus * bonus_scale
 
     speed = info.get("speed", 0)
     speed_limit = info.get("speed_limit", 220)
@@ -600,22 +609,33 @@ def shape_reward(
         curr_milestones = int(total_distance / config.reward_distance_milestone_interval)
         milestones_achieved = curr_milestones - prev_milestones
         if milestones_achieved > 0:
-            shaped_reward += config.reward_distance_milestone * milestones_achieved
+            shaped_reward += config.reward_distance_milestone * milestones_achieved * bonus_scale
 
     fuel_current = info.get("fuel", 0)
     fuel_prev = prev_info.get("fuel", 0)
     if fuel_current > fuel_prev + 5:
-        shaped_reward += config.reward_fuel_bonus
+        shaped_reward += config.reward_fuel_bonus * bonus_scale
 
-    stage_current = info.get("stage", 1)
     stage_prev = prev_info.get("stage", 1)
-    if stage_current > stage_prev:
-        shaped_reward += config.reward_stage_bonus * stage_current
+    if stage > stage_prev:
+        shaped_reward += config.reward_stage_bonus * stage
 
     if game_mode == "crashed" and prev_info.get("game_mode") == "playing":
-        stage = info.get("stage", 1)
         stage_scale = 1.0 + config.reward_crash_penalty_stage_scale * (stage - 1)
         shaped_reward -= config.reward_crash_penalty * stage_scale
+
+    # Fuel exhaustion penalty — dying from empty fuel is as bad as a crash
+    if (game_mode == "game_over" and prev_info.get("game_mode") == "playing"
+            and prev_info.get("fuel", 100) <= 1.0
+            and config.reward_fuel_exhaustion_penalty > 0):
+        stage_scale = 1.0 + config.reward_crash_penalty_stage_scale * (stage - 1)
+        shaped_reward -= config.reward_fuel_exhaustion_penalty * stage_scale
+
+    # Low fuel urgency — continuous per-step penalty below 30% fuel
+    if config.reward_low_fuel_penalty > 0:
+        fuel = info.get("fuel", 100)
+        if fuel < 30:
+            shaped_reward -= config.reward_low_fuel_penalty * (30 - fuel) / 30
 
     return shaped_reward
 

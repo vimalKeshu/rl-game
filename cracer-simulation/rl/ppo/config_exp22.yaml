@@ -1,0 +1,115 @@
+# PPO Training Configuration — Experiment 22
+#
+# Warm-start from Exp21 (fuel awareness added)
+#
+# New feature: Stage-scaled bonuses (symmetric with penalties)
+#
+# Observation: penalties scale with stage (crash/fuel exhaustion cost more at high stages)
+# but bonuses were flat — surviving at stage 10 paid the same as stage 1.
+# This asymmetry means the agent avoids death but has no proportionally stronger
+# incentive to stay alive and fight at high stages.
+#
+# Fix: reward_bonus_stage_scale = 0.3 (same direction as crash penalty scale 0.4, slightly lower)
+#   bonus_multiplier = 1 + 0.3 × (stage - 1)
+#   Stage 1:  ×1.0  (unchanged)
+#   Stage 5:  ×2.2  (survival/fuel/milestone worth 2.2x more)
+#   Stage 10: ×3.7  (surviving at stage 10 pays 3.7x per step)
+#   Stage 15: ×5.2
+#
+# Scaled bonuses:
+#   survival_bonus:      0.2/step → 0.74/step at stage 10
+#   fuel_pickup_bonus:   45 pts  → 166 pts at stage 10
+#   distance_milestone:  40 pts  → 148 pts at stage 10
+#
+# This creates a symmetric risk-reward landscape:
+#   Dying at stage 10 costs 2760 pts (crash) — same as before
+#   Surviving each step at stage 10 earns 0.74 pts — 3.7x more than before
+#   Picking up fuel at stage 10 earns 166 pts — agent has strong reason to seek it
+
+total_timesteps: 25000000
+max_episode_steps: 100000
+
+learning_rate: 0.00002
+learning_rate_end: 0.0000003
+anneal_lr: true
+gamma: 0.99
+gae_lambda: 0.98
+clip_epsilon: 0.2
+value_coef: 0.10
+entropy_coef: 0.001
+entropy_coef_end: 0.0001
+anneal_entropy: true
+max_grad_norm: 0.5
+normalize_returns: false
+
+rollout_steps: 4096
+num_epochs: 8
+batch_size: 64
+
+hidden_sizes:
+  - 512
+  - 512
+  - 512
+  - 256
+use_layer_norm: true
+shared_backbone: false
+
+normalize_obs: true
+obs_clip: 10.0
+frame_stack: 4
+max_objects: 10
+
+# Penalties — unchanged from Exp21
+reward_crash_penalty: 600.0
+reward_crash_penalty_stage_scale: 0.4
+reward_fuel_exhaustion_penalty: 600.0
+reward_low_fuel_penalty: 2.0
+
+# Base bonuses — same as before (stage scaling applied on top)
+reward_survival_bonus: 0.2
+reward_distance_scale: 0.2
+reward_stage_bonus: 500.0
+reward_speed_scale: 0.1
+reward_fuel_bonus: 45.0
+reward_pothole_penalty: 8.0
+reward_distance_milestone: 40.0
+reward_distance_milestone_interval: 300
+reward_safe_speed_bonus: 0.08
+
+# NEW: Stage-scaled bonuses
+reward_bonus_stage_scale: 0.3   # symmetric direction to crash penalty (0.4), slightly lower
+
+randomize_seed: true
+seed_range: 1000
+
+# Same stage mix as Exp21
+stage_mix:
+  1:  0.35
+  2:  0.15
+  3:  0.12
+  4:  0.10
+  5:  0.09
+  6:  0.08
+  7:  0.05
+  8:  0.03
+  9:  0.02
+  10: 0.01
+
+curriculum_enabled: false
+early_stopping_patience: 0
+
+eval_interval_updates: 25
+eval_episodes: 10
+eval_start_stages:
+  - 1
+  - 5
+  - 8
+eval_deterministic: true
+eval_max_episode_steps: 100000
+
+log_interval: 1
+save_interval: 25
+checkpoint_dir: rl/ppo/checkpoints
+
+env_fps: 60
+device: cpu
