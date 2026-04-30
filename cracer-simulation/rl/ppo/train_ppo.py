@@ -1648,11 +1648,24 @@ def warm_start_actor(actor_critic: nn.Module,
     print(f"\nWarm-starting actor from: {checkpoint_path}")
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
-    # Load full actor_critic state but only keep actor weights
-    # PPO uses a single ActorCritic network — we load all weights then
-    # note the critic will be retrained (its weights are overwritten by optimizer)
-    actor_critic.load_state_dict(ckpt["actor_critic"])
-    print("  Actor-critic weights loaded (critic will retrain from scratch).")
+    saved_state = ckpt["actor_critic"]
+    current_state = actor_critic.state_dict()
+
+    # Match only keys that exist in both and have identical shapes
+    matched = {}
+    skipped = []
+    for key, current_tensor in current_state.items():
+        if key in saved_state and saved_state[key].shape == current_tensor.shape:
+            matched[key] = saved_state[key]
+        else:
+            matched[key] = current_tensor  # keep random init
+            skipped.append(key)
+
+    actor_critic.load_state_dict(matched)
+    loaded = len(current_state) - len(skipped)
+    print(f"  Weights loaded: {loaded}/{len(current_state)} layers matched.")
+    if skipped:
+        print(f"  Skipped (shape/key mismatch): {len(skipped)} layers — using random init.")
 
     if obs_normalizer is not None and "obs_normalizer" in ckpt:
         obs_normalizer.load_state(ckpt["obs_normalizer"])
