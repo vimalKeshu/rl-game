@@ -206,12 +206,17 @@ def resolve_model_config(args, checkpoint) -> dict:
     model_config = checkpoint.get("model_config") if isinstance(checkpoint, dict) else None
 
     config = {
+        "network_arch": "mlp",
         "hidden_sizes": (256, 256),
         "use_layer_norm": False,
         "shared_backbone": False,
         "frame_stack": 1,
         "normalize_obs": False,
         "max_objects": 10,
+        "transformer_embed_dim": 256,
+        "transformer_num_layers": 2,
+        "transformer_ffn_dim": 1024,
+        "transformer_num_heads": 1,
     }
 
     if args.hidden_sizes:
@@ -220,24 +225,46 @@ def resolve_model_config(args, checkpoint) -> dict:
         config["hidden_sizes"] = tuple(model_config["hidden_sizes"])
 
     if model_config:
+        config["network_arch"] = model_config.get("network_arch", "mlp")
         config["use_layer_norm"] = model_config.get("use_layer_norm", False)
         config["shared_backbone"] = model_config.get("shared_backbone", False)
         config["frame_stack"] = model_config.get("frame_stack", 1)
         config["normalize_obs"] = model_config.get("normalize_obs", False)
         config["max_objects"] = model_config.get("max_objects", 10)
+        config["transformer_embed_dim"] = model_config.get("transformer_embed_dim", 256)
+        config["transformer_num_layers"] = model_config.get("transformer_num_layers", 2)
+        config["transformer_ffn_dim"] = model_config.get("transformer_ffn_dim", 1024)
+        config["transformer_num_heads"] = model_config.get("transformer_num_heads", 1)
 
     return config
 
 
 def create_network(obs_size: int, num_actions: int, config: dict, device: str) -> nn.Module:
-    """Create the ActorCritic network based on config."""
-    net = ActorCritic(
-        obs_size=obs_size,
-        num_actions=num_actions,
-        hidden_sizes=config["hidden_sizes"],
-        use_layer_norm=config["use_layer_norm"],
-        shared_backbone=config["shared_backbone"],
-    )
+    """Create the ActorCritic or ActorCriticTransformer based on config."""
+    if config["network_arch"] == "transformer":
+        from train_ppo import ActorCriticTransformer
+        net = ActorCriticTransformer(
+            obs_size=obs_size,
+            num_actions=num_actions,
+            max_objects=config["max_objects"],
+            frame_stack=config["frame_stack"],
+            embed_dim=config["transformer_embed_dim"],
+            num_layers=config["transformer_num_layers"],
+            ffn_dim=config["transformer_ffn_dim"],
+            num_heads=config["transformer_num_heads"],
+        )
+        print(f"Network: Transformer (embed={config['transformer_embed_dim']}, "
+              f"layers={config['transformer_num_layers']}, ffn={config['transformer_ffn_dim']}, "
+              f"heads={config['transformer_num_heads']})")
+    else:
+        net = ActorCritic(
+            obs_size=obs_size,
+            num_actions=num_actions,
+            hidden_sizes=config["hidden_sizes"],
+            use_layer_norm=config["use_layer_norm"],
+            shared_backbone=config["shared_backbone"],
+        )
+        print(f"Network: MLP (hidden={config['hidden_sizes']})")
     return net.to(device)
 
 

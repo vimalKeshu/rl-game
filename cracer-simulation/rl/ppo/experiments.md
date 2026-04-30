@@ -597,4 +597,105 @@
   - total_timesteps: 30M → 20M
 - **All other settings identical to Exp26** (max_objects=30, speed_scale=0.5, full reward stack)
 - **Target**: s1_avg(last10) > 8.0, s1_best > 10.0
+- **Final results** (20M steps, completed):
+  - s1_best=**8.6**  |  s1_avg(last10)=**6.99**
+  - Stronger than Exp19 equivalent (7.4 / 6.03) — max_objects=30 + speed_scale=0.5 paying off
+- **Status**: COMPLETED
+
+---
+
+## Experiment 28: "Transformer Architecture — Fresh Training" (RUNNING)
+- **Date**: 2026-04-26  |  **No warm-start — random weights**
+- **Core change**: network_arch: mlp → transformer
+- **Architecture**: ActorCriticTransformer
+  - Single-head self-attention (num_heads=1)
+  - Separate actor + critic transformer encoders
+  - 2 transformer layers, embed_dim=256, ffn_dim=1024
+  - CLS token aggregates global context for actor/critic heads
+  - 125 tokens per forward pass (1 CLS + 31 per frame × 4 frames)
+  - ~3.2M parameters
+- **Why transformer**:
+  MLP treats 30 objects as a flat 1004-dim vector — no sense of object relationships.
+  Transformer self-attention dynamically weights which objects matter most
+  (fuel can when fuel is low, enemy on collision course, etc.).
+  Permutation-invariant over objects — naturally handles variable enemy positions.
+- **Same fresh training strategy** as Exp18/Exp26:
+  LR=3e-4, entropy=0.01, stage_mix={1:0.70, 2:0.20, 3:0.10}, 30M steps
+  max_objects=30, speed_scale=0.5, full reward stack
+- **Target**: match Exp26 trajectory (s1_avg > 5.0 at 30M), then surpass MLP ceiling in Exp29+
+
+### Architecture Design Decisions
+
+#### Why sequence_length = 4 (one token per frame)
+
+The original design had 125 tokens (1 CLS + 31 object/player tokens × 4 frames).
+We changed to 4 tokens — one per frame — for these reasons:
+
+- Each frame token = full game snapshot [251 dims: 11 player + 30×8 objects]
+- Sequence of 4 tokens = 4 consecutive timesteps (~67ms apart at 60fps)
+- Transformer attends over **TIME** not over individual objects within a frame
+- Natural question: "how did the game state evolve over the last 4 steps?"
+- Self-attention over 4 tokens is ~930x fewer computations than 125 tokens
+- Input shape: `[BATCH=64, SEQ=4, DIM=251→256]`
+
+**What self-attention learns from 4 frames:**
+Each frame attends to all others. Attention weights reveal which past frame
+is most relevant to the current decision:
+- Frame t-1 most relevant → tracking momentum / recent state changes
+- Frame t-3 most relevant → comparing to a baseline / detecting drift
+- All frames equal → detecting periodic patterns (speed zone cycles)
+
+#### Why 4-head attention (multi-head)
+
+Single-head learns ONE way to relate frames. 4 heads learn 4 DIFFERENT
+temporal relationship patterns simultaneously, each in a 64-dim subspace:
+
+| Head | What it learns |
+|------|----------------|
+| Head 1 | Speed/momentum — "Did I accelerate or brake over last 4 frames?" |
+| Head 2 | Threat proximity — "Is the nearest enemy getting closer each frame?" |
+| Head 3 | Fuel urgency — "Fuel dropped 15pts last 3 frames, I need a pickup" |
+| Head 4 | Stage transition — "Did the stage just change? New enemies spawned?" |
+
+Multi-head has the **same parameter count** as single-head — Q/K/V matrices
+are the same size, just split into subspaces. No extra cost, richer patterns.
+
+#### Architecture summary
+
+```
+[B, 1004] → reshape → [B, 4, 251]
+          → Linear(251→256) + pos_embed → [B, 4, 256]
+          → TransformerEncoder (2 layers, 4 heads, ffn=512) [separate actor/critic]
+          → mean pool → [B, 256]
+          → actor head: 256→9  |  critic head: 256→1
+```
+
+Parameters: ~2.18M (vs 3.2M for old 125-token design, 2.35M for MLP)
+
+- **Final results** (killed at 4.06M steps):
+  - s1_avg oscillating 1.4–2.2 — no consistent improvement over MLP baseline
+  - Transformer unsuitable for this environment — observation frames are hand-crafted
+    float tuples with no hidden structure for attention to discover
+  - MLP already handles the 4-frame temporal context optimally via concatenation
+  - Self-attention finds no meaningful relationships in engineered float sequences
+- **Lesson**: Transformer excels at raw/minimal inputs (pixels, word IDs) where model
+  must discover structure. Our obs is fully engineered — MLP is the right architecture.
+- **Status**: KILLED at 4.06M — reverting to MLP
+
+---
+
+## Experiment 28 (revised): "MLP — Expand Stage Mix 1-10 (max_objects=30 chain)" (RUNNING)
+- **Date**: 2026-04-27  |  Warm-start: Exp27 best_eval.pt (s1_best=8.6, s1_avg=6.99)
+- **Same move as Exp19→Exp20**: expand stage mix from {1-6} to {1-10}
+  Exp19→Exp20 took s1_best 7.4 → 10.1. With stronger Exp27 foundation (8.6 vs 7.4),
+  expect to push past 10.1 toward 12+.
+- **Changes from Exp27**:
+  - stage_mix: {1:0.35, 2:0.15, 3:0.12, 4:0.10, 5:0.09, 6:0.08, 7:0.05, 8:0.03, 9:0.02, 10:0.01}
+  - learning_rate: 1e-4 → 3e-5 (more mature policy)
+  - entropy_coef: 0.005 → 0.002
+  - value_coef: 0.15 → 0.10
+  - total_timesteps: 20M → 25M
+  - eval_start_stages: [1, 5, 8]
+- **All other settings identical to Exp27** (max_objects=30, speed_scale=0.5, MLP)
+- **Target**: s1_best > 12, s1_avg(last10) > 9.0
 - **Status**: RUNNING

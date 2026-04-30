@@ -70,9 +70,17 @@ class TrainConfig:
     total_timesteps: int = 1_000_000  # Total training timesteps
 
     # Network architecture
-    hidden_sizes: Tuple[int, ...] = (512, 512, 256)  # Larger network
-    use_layer_norm: bool = True  # Enable layer normalization
-    shared_backbone: bool = False  # Share layers between actor and critic
+    network_arch: str = "mlp"          # "mlp" or "transformer"
+    hidden_sizes: Tuple[int, ...] = (512, 512, 256)  # MLP hidden layer sizes
+    use_layer_norm: bool = True        # MLP: layer norm; Transformer: always uses layer norm
+    shared_backbone: bool = False      # MLP only: share layers between actor and critic
+
+    # Transformer architecture (used when network_arch="transformer")
+    # embed_dim=256, num_layers=2, ffn_dim=1024, num_heads=1 → ~3.17M params (separate actor/critic)
+    transformer_embed_dim: int = 256   # token embedding dimension
+    transformer_num_layers: int = 2    # number of transformer encoder layers
+    transformer_ffn_dim: int = 512     # feedforward dimension inside each transformer layer
+    transformer_num_heads: int = 4     # attention heads (4 heads × 64 dims = 256 embed_dim)
 
     # Observation normalization
     normalize_obs: bool = True  # Enable observation normalization
@@ -353,6 +361,149 @@ class ActorCritic(nn.Module):
 
     def get_value(self, x: torch.Tensor) -> torch.Tensor:
         """Get value estimate only."""
+        _, value = self(x)
+        return value
+
+
+class ActorCriticTransformer(nn.Module):
+    """Actor-Critic with Temporal Transformer backbone for PPO.
+
+    Design: [BATCH, frame_stack, frame_dim] — each frame is one token.
+
+    Sequence length = frame_stack = 4
+      Each token = one full game frame (player state + all objects flattened)
+      frame_dim = PLAYER_DIMS + max_objects × OBJECT_DIMS
+               = 11 + 30 × 8 = 251 (for max_objects=30)
+
+    Why sequence_length=4 (one token per frame):
+      The 4 frames represent 4 consecutive timesteps (~67ms apart at 60fps).
+      Treating each frame as one token lets the transformer reason over TIME —
+      how the game state evolved over the last 4 steps — rather than over
+      individual objects within a frame. This is a natural fit: self-attention
+      over 4 temporal tokens asks "how does what I saw 3 steps ago relate to now?"
+
+    Why multi-head attention (4 heads):
+      A single attention head learns ONE way to relate frames to each other.
+      4 heads learn 4 DIFFERENT temporal relationship patterns simultaneously,
+      each operating in a 64-dim subspace of the 256-dim embedding:
+        Head 1 — speed/momentum pattern:
+                 "Did I accelerate or brake over the last 4 frames?"
+        Head 2 — threat proximity pattern:
+                 "Is the nearest enemy getting closer each frame?"
+        Head 3 — fuel urgency pattern:
+                 "Fuel dropped 15 pts last 3 frames — I need a pickup soon"
+        Head 4 — stage transition pattern:
+                 "Did the stage just change? New enemies spawned this frame?"
+      The heads' outputs are concatenated back to 256-dim — richer than
+      any single attention pattern could capture alone.
+
+    What self-attention learns from 4 frames:
+      Each frame attends to all other frames. The attention weights tell the
+      network which past frame is most relevant right now. For example:
+      - Frame t-1 is most relevant when tracking momentum (recent state)
+      - Frame t-3 is most relevant when comparing to a "baseline" state
+      - All frames equally relevant when detecting periodic patterns (speed zones)
+
+    Architecture:
+      frame_dim → Linear(frame_dim, embed_dim) → [B, 4, embed_dim]
+      + learnable positional embedding [4, embed_dim]
+      → TransformerEncoder (2 layers, 4 heads, separate actor/critic)
+      → mean pool over 4 frames → [B, embed_dim]
+      → actor head: embed_dim → num_actions
+      → critic head: embed_dim → 1
+
+    Parameters: ~2.24M (vs 3.2M for old 125-token design, ~2.35M for MLP)
+    Sequence length: 4 (vs 125 before) → ~930x fewer attention computations
+    """
+
+    def __init__(
+        self,
+        obs_size: int,
+        num_actions: int,
+        max_objects: int,
+        frame_stack: int,
+        embed_dim: int = 256,
+        num_layers: int = 2,
+        ffn_dim: int = 512,
+        num_heads: int = 4,
+    ):
+        super().__init__()
+        self.num_actions = num_actions
+        self.frame_stack = frame_stack
+        self.embed_dim = embed_dim
+
+        # Each frame is one token: frame_dim = obs_size / frame_stack
+        if obs_size % frame_stack != 0:
+            raise ValueError(f"obs_size={obs_size} must be divisible by frame_stack={frame_stack}")
+        self.frame_dim = obs_size // frame_stack  # 251 for max_objects=30
+
+        # Project each frame to embed_dim
+        self.frame_proj = nn.Linear(self.frame_dim, embed_dim)
+
+        # Learnable positional embedding — one per frame position (t-3, t-2, t-1, t)
+        self.pos_embed = nn.Parameter(torch.zeros(1, frame_stack, embed_dim))
+
+        # Separate transformer encoders for actor and critic
+        # 4-head attention: each head learns a different temporal pattern
+        # embed_dim=256, num_heads=4 → 64 dims per head
+        def make_encoder():
+            layer = nn.TransformerEncoderLayer(
+                d_model=embed_dim,
+                nhead=num_heads,
+                dim_feedforward=ffn_dim,
+                dropout=0.0,
+                activation="gelu",
+                batch_first=True,
+                norm_first=True,   # pre-norm: more stable for RL training
+            )
+            return nn.TransformerEncoder(layer, num_layers=num_layers, enable_nested_tensor=False)
+
+        self.actor_transformer = make_encoder()
+        self.critic_transformer = make_encoder()
+
+        # Output heads
+        self.actor_head = nn.Linear(embed_dim, num_actions)
+        self.critic_head = nn.Linear(embed_dim, 1)
+
+        nn.init.normal_(self.pos_embed, std=0.02)
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            nn.init.orthogonal_(module.weight, gain=np.sqrt(2))
+            nn.init.zeros_(module.bias)
+
+    def _encode(self, x: torch.Tensor, transformer: nn.Module) -> torch.Tensor:
+        """Encode flat observation through temporal transformer.
+
+        Args:
+            x: [B, obs_size]  flat stacked observation
+        Returns:
+            features: [B, embed_dim]  mean-pooled over 4 frame tokens
+        """
+        B = x.shape[0]
+        # Reshape: [B, obs_size] → [B, frame_stack, frame_dim]
+        frames = x.view(B, self.frame_stack, self.frame_dim)
+        # Project each frame to embed space: [B, 4, embed_dim]
+        tokens = self.frame_proj(frames) + self.pos_embed
+        # Transformer: 4-head self-attention over temporal sequence
+        out = transformer(tokens)          # [B, 4, embed_dim]
+        # Mean pool: aggregate all 4 frame representations
+        return out.mean(dim=1)             # [B, embed_dim]
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        actor_feat = self._encode(x, self.actor_transformer)
+        critic_feat = self._encode(x, self.critic_transformer)
+        return self.actor_head(actor_feat), self.critic_head(critic_feat).squeeze(-1)
+
+    def get_action_and_value(self, x: torch.Tensor, action: Optional[torch.Tensor] = None):
+        action_logits, value = self(x)
+        dist = Categorical(logits=action_logits)
+        if action is None:
+            action = dist.sample()
+        return action, dist.log_prob(action), dist.entropy(), value
+
+    def get_value(self, x: torch.Tensor) -> torch.Tensor:
         _, value = self(x)
         return value
 
@@ -983,14 +1134,33 @@ def train(config: TrainConfig, resume: bool = True, warm_start_path: str = "") -
     print(f"Observation space: {base_obs_size} (stacked: {obs_size})")
     print(f"Action space: {num_actions}")
 
-    # Create network
-    actor_critic = ActorCritic(
-        obs_size=obs_size,
-        num_actions=num_actions,
-        hidden_sizes=config.hidden_sizes,
-        use_layer_norm=config.use_layer_norm,
-        shared_backbone=config.shared_backbone,
-    ).to(device)
+    # Create network — choice driven by config.network_arch
+    if config.network_arch == "transformer":
+        actor_critic = ActorCriticTransformer(
+            obs_size=obs_size,
+            num_actions=num_actions,
+            max_objects=config.max_objects,
+            frame_stack=config.frame_stack,
+            embed_dim=config.transformer_embed_dim,
+            num_layers=config.transformer_num_layers,
+            ffn_dim=config.transformer_ffn_dim,
+            num_heads=config.transformer_num_heads,
+        ).to(device)
+        print(f"Network: Transformer (embed={config.transformer_embed_dim}, "
+              f"layers={config.transformer_num_layers}, ffn={config.transformer_ffn_dim}, "
+              f"heads={config.transformer_num_heads})")
+    else:
+        actor_critic = ActorCritic(
+            obs_size=obs_size,
+            num_actions=num_actions,
+            hidden_sizes=config.hidden_sizes,
+            use_layer_norm=config.use_layer_norm,
+            shared_backbone=config.shared_backbone,
+        ).to(device)
+        print(f"Network: MLP (hidden={config.hidden_sizes}, layer_norm={config.use_layer_norm})")
+
+    total_params = sum(p.numel() for p in actor_critic.parameters())
+    print(f"Total parameters: {total_params:,}")
 
     optimizer = optim.Adam(actor_critic.parameters(), lr=config.learning_rate, eps=1e-5)
 
@@ -1443,12 +1613,17 @@ def save_checkpoint(model: nn.Module, optimizer: optim.Optimizer, config: TrainC
         "global_step": global_step,
         "num_updates": num_updates,
         "model_config": {
+            "network_arch": config.network_arch,
             "hidden_sizes": config.hidden_sizes,
             "use_layer_norm": config.use_layer_norm,
             "shared_backbone": config.shared_backbone,
             "frame_stack": config.frame_stack,
             "normalize_obs": config.normalize_obs,
             "max_objects": config.max_objects,
+            "transformer_embed_dim": config.transformer_embed_dim,
+            "transformer_num_layers": config.transformer_num_layers,
+            "transformer_ffn_dim": config.transformer_ffn_dim,
+            "transformer_num_heads": config.transformer_num_heads,
         },
     }
     if obs_normalizer is not None:

@@ -1,0 +1,142 @@
+can we do something like this Sequence length is 4 which represents  4 frames of each observed timestep. And embedded dim would be each frame       
+  dimension ? like [BATCH, 4 FRAME, FRAME DIMENSION]                                                                                                  
+                                                                                                                                                      
+⏺ Yes — this is actually a cleaner and more natural design. Instead of flattening all 4 frames into 125 tokens, treat each frame as a single token.   
+  The transformer then reasons over time (4 frames = 4 timesteps) rather than over objects within a frame.
+                                                                                                                                                      
+  [BATCH, 4, 251]
+    │      │   │                                                                                                                                      
+    │      │   └── 251: one full frame (11 player + 30×8 objects) projected to embed_dim                                                              
+    │      └── 4: sequence of 4 frames (temporal sequence)                                                                                            
+    └── 64: minibatch                                                                                                                                 
+                                                                                                                                                      
+  ---                                                                                                                                                 
+  What changes vs current design                                                                                                                      
+                                                                                                                                                      
+  ┌─────────────────────────────┬────────────────────────┬──────────────────────────────┐
+  │                             │  Current (125 tokens)  │        New (4 tokens)        │                                                             
+  ├─────────────────────────────┼────────────────────────┼──────────────────────────────┤                                                             
+  │ Sequence length             │ 125                    │ 4                            │                                                             
+  ├─────────────────────────────┼────────────────────────┼──────────────────────────────┤                                                             
+  │ What attention reasons over │ Objects + frames mixed │ Time (frame t-3 → t)         │                                                             
+  ├─────────────────────────────┼────────────────────────┼──────────────────────────────┤                                                             
+  │ Token =                     │ 1 player or 1 object   │ 1 full frame                 │                                                             
+  ├─────────────────────────────┼────────────────────────┼──────────────────────────────┤                                                             
+  │ Embed dim                   │ 256                    │ 251 → projected to embed_dim │
+  ├─────────────────────────────┼────────────────────────┼──────────────────────────────┤                                                             
+  │ Parameters                  │ ~3.2M                  │ Much smaller                 │
+  └─────────────────────────────┴────────────────────────┴──────────────────────────────┘                                                             
+                  
+  ---                                                                                                                                                 
+  What self-attention does in the new design
+                                                                                                                                                      
+  With 4 tokens (one per frame), the transformer asks:
+  - "How does what I saw 3 steps ago relate to what I see now?"                                                                                       
+  - "Did that enemy get closer between frame t-2 and frame t?"                                                                                        
+  - "Fuel was 45 at t-3, now it's 12 — I should seek a pickup"                                                                                        
+                                                                                                                                                      
+  This is temporal reasoning — exactly what frame stacking was trying to approximate with MLP, but now done explicitly with attention.                
+                                                                                                                                                      
+  The current 125-token design does object-level reasoning — "which of these 30 objects matters most right now?". Both are valid but the 4-frame      
+  temporal design is simpler, faster, and maps more naturally to the frame-stack concept.                                                             
+                                                                                                                                                      
+  ---                                                                                                                                                 
+  Parameter estimate
+                                                                                                                                                      
+  # frame_dim = 251, embed_dim = 256, ffn = 512, layers = 2, heads = 1
+  frame_proj  = 251 × 256 + 256        = 64,512                                                                                                       
+  # Transformer layer (4 tokens)                                                                                                                      
+  attn        = 4 × (256×256 + 256)    = 263,168                                                                                                      
+  ffn         = 256×512 + 512×256      = 262,144 + bias ≈ 263,168                                                                                     
+  per_layer   ≈ 526,336                                                                                                                               
+  backbone    = 64,512 + 2 × 526,336   = 1,117,184  (shared projector)                                                                                
+  # Separate actor + critic                                                                                                                           
+  total       ≈ 2 × 1,117,184 + heads  ≈ 2.24M params                                                                                                 
+                                                                                                                                                      
+  Slightly fewer parameters than the current 3.2M, and much faster — attention over 4 tokens instead of 125 is ~930x fewer attention computations per 
+  forward pass.                                                                                                                                       
+                                                                                                                                                      
+  ---                                                                                                                                                 
+  Want me to implement this [BATCH, 4, 251] design and replace the current ActorCriticTransformer?
+                                                                                                                                                      
+❯ to map relationship between objects, lets make the transformer multi head ? what do you think ?                                                     
+                                                                                                                                                      
+⏺ Great instinct. Here's the thinking:                                                                                                                
+                                                                                                                                                      
+  Why multi-head makes sense for object relationships                                                                                                 
+                                                                                                                                                      
+  With the [BATCH, 4, 251] design, each frame token contains all 30 objects packed together. A single attention head learns one way to relate frames  
+  to each other. Multiple heads learn different relationship patterns simultaneously:
+                                                                                                                                                      
+  ┌────────┬─────────────────────────────────────────────────────────────┐                                                                            
+  │  Head  │                     What it might learn                     │
+  ├────────┼─────────────────────────────────────────────────────────────┤                                                                            
+  │ Head 1 │ "How did my speed change over the last 4 frames?"           │
+  ├────────┼─────────────────────────────────────────────────────────────┤                                                                            
+  │ Head 2 │ "Is the nearest enemy getting closer or further?"           │                                                                            
+  ├────────┼─────────────────────────────────────────────────────────────┤                                                                            
+  │ Head 3 │ "Fuel trend — am I burning fast? Is a pickup coming?"       │                                                                            
+  ├────────┼─────────────────────────────────────────────────────────────┤                                                                            
+  │ Head 4 │ "Did I just clear a stage? What changed at the transition?" │
+  └────────┴─────────────────────────────────────────────────────────────┘                                                                            
+                  
+  Each head gets a 64-dim subspace of the 256-dim embedding and attends to the 4 frames independently. Their outputs are concatenated back to 256.    
+                  
+  ---                                                                                                                                                 
+  How many heads? 
+                                                                                                                                                      
+  embed_dim must be divisible by num_heads. For embed_dim=256:
+                                                                                                                                                      
+  ┌───────┬───────────────────┬─────────────────────────────────────────────┐                                                                         
+  │ Heads │ Subspace per head │                  Reasoning                  │                                                                         
+  ├───────┼───────────────────┼─────────────────────────────────────────────┤                                                                         
+  │ 1     │ 256               │ single pattern (current)                    │
+  ├───────┼───────────────────┼─────────────────────────────────────────────┤
+  │ 2     │ 128               │ two patterns                                │                                                                         
+  ├───────┼───────────────────┼─────────────────────────────────────────────┤                                                                         
+  │ 4     │ 64                │ good balance — 4 distinct temporal patterns │                                                                         
+  ├───────┼───────────────────┼─────────────────────────────────────────────┤                                                                         
+  │ 8     │ 32                │ subspaces get thin for only 4 tokens        │
+  └───────┴───────────────────┴─────────────────────────────────────────────┘                                                                         
+                  
+  4 heads is the sweet spot for a 4-token sequence. 8 heads would give each head only 32 dims to work with across 4 tokens — not enough room to learn 
+  meaningful patterns.
+                                                                                                                                                      
+  ---             
+  Parameter impact
+                                                                                                                                                      
+  Multi-head attention has the same parameter count as single-head — the Q/K/V matrices are the same size regardless of how many heads split them. The
+   only difference is how attention is computed internally. So we stay at ~2.24M params.                                                              
+                  
+  ---                                                                                                                                                 
+  Revised architecture
+                                                                                                                                                      
+  [BATCH, 4, 251] 
+         │                                                                                                                                            
+         │  Linear(251 → 256)   ← project each frame to embed space                                                                                   
+         ▼                                                                                                                                            
+  [BATCH, 4, 256]                                                                                                                                     
+         │                                                                                                                                            
+         │  + Positional embedding [4, 256]                                                                                                           
+         ▼                                                                                                                                            
+  ┌─────────────────────────────┐                                                                                                                     
+  │  TransformerEncoderLayer    │                                                                                                                     
+  │  4-head self-attention      │                                                                                                                     
+  │  head1: frames → 64-dim     │  "speed/momentum pattern"                                                                                           
+  │  head2: frames → 64-dim     │  "enemy proximity pattern"                                                                                          
+  │  head3: frames → 64-dim     │  "fuel trend pattern"                                                                                               
+  │  head4: frames → 64-dim     │  "stage progress pattern"                                                                                           
+  │  concatenate → 256-dim      │                                                                                                                     
+  │  FFN: 256 → 512 → 256       │                                                                                                                     
+  └─────────────────────────────┘                                                                                                                     
+         × 2 layers                                                                                                                                   
+         │                                                                                                                                            
+         │  mean pool over 4 frames (or CLS token)                                                                                                    
+         ▼                                                                                                                                            
+    [BATCH, 256]                                                                                                                                      
+    ┌──────────┐    ┌──────────┐                                                                                                                      
+    │  Actor   │    │  Critic  │                                                                                                                      
+    │  256 → 9 │    │  256 → 1 │                                                                                                                      
+    └──────────┘    └──────────┘                                                                                                                      
+                                                                                                                                                      
+  Want me to implement this updated design?   
