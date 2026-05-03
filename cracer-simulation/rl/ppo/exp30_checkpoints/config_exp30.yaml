@@ -1,27 +1,17 @@
-# PPO Training Configuration — Experiment 32
+# PPO Training Configuration — Experiment 30
 #
-# Warm-start: Exp30 best_eval.pt (s1_best=12.3, all-time record)
+# Warm-start: Exp29 best_eval.pt (s1_best=11.7, s1_avg=8.44)
 #
-# Two targeted changes to break the 12.3 ceiling:
-#
-# 1. seed_range: 1000 → 10000
-#    Agent was partially memorising 1000 maps. With 10000 maps each seen
-#    far fewer times, agent must learn universal driving skills rather than
-#    map-specific tricks. Expected: avg rises (more consistent), gap between
-#    best and avg narrows significantly.
-#
-# 2. total_timesteps: 25M → 35M (+40% more training)
-#    Exp30 was still improving at 25M end. More steps at the proven 1-20
-#    distribution consolidates the policy further.
-#
-# Stage mix: same as Exp30 (1-20) — proven best distribution.
-# Expanding to 1-25 (Exp31) caused regression — too diluted.
+# Same move as Exp24: expand stage mix from 1-15 to 1-20.
+# Key advantage over old Exp24: max_objects=30 means the agent can
+# actually see the full road at stages 15-20 where old chain was blind.
+# Old Exp24 with max_objects=10 got s1_best=11.8 — expect to surpass that.
 
-total_timesteps: 100000000
+total_timesteps: 25000000
 max_episode_steps: 100000
 
-learning_rate: 0.000002
-learning_rate_end: 0.00000001
+learning_rate: 0.000015
+learning_rate_end: 0.0000002
 anneal_lr: true
 gamma: 0.99
 gae_lambda: 0.98
@@ -68,9 +58,9 @@ reward_safe_speed_bonus: 0.08
 reward_bonus_stage_scale: 0.3
 
 randomize_seed: true
-seed_range: 10000   # KEY CHANGE: was 1000, now 10000 — force true generalisation
+seed_range: 1000
 
-# Same proven 1-20 stage mix as Exp30
+# Expanded to stages 1-20
 stage_mix:
   1:  0.20
   2:  0.10

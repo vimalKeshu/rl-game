@@ -697,5 +697,91 @@ Parameters: ~2.18M (vs 3.2M for old 125-token design, 2.35M for MLP)
   - total_timesteps: 20M → 25M
   - eval_start_stages: [1, 5, 8]
 - **All other settings identical to Exp27** (max_objects=30, speed_scale=0.5, MLP)
-- **Target**: s1_best > 12, s1_avg(last10) > 9.0
+- **Final results** (25M steps, completed):
+  - s1_best=**9.8**  |  s1_avg(last10)=**7.74**  |  training mean_stage=8.89
+  - Consistent progress — max_objects=30 chain tracking just below old chain
+- **Status**: COMPLETED
+
+---
+
+## Experiment 29: "Expand Stage Mix 1-15 (max_objects=30 chain)" (RUNNING)
+- **Date**: 2026-05-01  |  Warm-start: Exp28 best_eval.pt (s1_best=9.8, s1_avg=7.74)
+- **Same move as Exp23**: expand stage mix from 1-10 to 1-15
+- **Changes from Exp28**:
+  - learning_rate: 3e-5 → 2e-5
+  - learning_rate_end: 5e-7 → 3e-7
+  - entropy_coef: 0.002 → 0.001
+  - stage_mix: expanded to stages 1-15, stage-1 anchor 35% → 25%
+  - eval_start_stages: [1, 5, 10]
+- **Final results** (25M steps, completed):
+  - s1_best=**11.7**  |  s1_avg(last10)=**8.44**  |  s10_best=13.7
+  - Matches old chain Exp23 (11.7) — max_objects=30 chain on par, set to diverge at 1-20
+- **Status**: COMPLETED
+
+---
+
+## Experiment 30: "Expand Stage Mix 1-20 (max_objects=30 chain)" (RUNNING)
+- **Date**: 2026-05-01  |  Warm-start: Exp29 best_eval.pt (s1_best=11.7, s1_avg=8.44)
+- **Same move as Exp24**: expand stage mix from 1-15 to 1-20
+- **Key advantage over old Exp24**: max_objects=30 — agent sees full road at stages 15-20
+  Old Exp24 (max_objects=10) got s1_best=11.8 — expect to surpass that here
+- **Changes from Exp29**:
+  - learning_rate: 2e-5 → 1.5e-5
+  - learning_rate_end: 3e-7 → 2e-7
+  - stage_mix: expanded to stages 1-20, stage-1 anchor 25% → 20%
+- **Final results** (25M steps, completed):
+  - s1_best=**12.3** (new all-time record, breaks old ceiling of 11.8)
+  - s1_avg(last10)=7.30  |  s10_best=13.7
+  - max_objects=30 confirmed advantage over old chain at equivalent stage expansion
+- **Status**: COMPLETED
+
+---
+
+## Experiment 31: "Expand Stage Mix 1-25" (RUNNING)
+- **Date**: 2026-05-02  |  Warm-start: Exp30 best_eval.pt (s1_best=12.3, all-time record)
+- **Expand stage mix from 1-20 to 1-25**
+  Agent reaches stage 12+ from cold start — direct practice on stages 21-25
+  gives the agent experience on territory it's already reaching in eval.
+- **Changes from Exp30**:
+  - learning_rate: 1.5e-5 → 1e-5
+  - learning_rate_end: 2e-7 → 1e-7
+  - stage_mix: expanded to stages 1-25, stage-1 anchor 20% → 18%
+- **Final results** (killed at 16.1M steps):
+  - s1_best=12.2 (below Exp30's 12.3), rolling_avg=8.78 — no improvement
+  - 1-25 stage mix too diluted: stage-1 anchor 18% not enough for cold-start gradient
+  - Same pattern as old Exps 10/11 — widening mix beyond sweet spot causes regression
+- **Status**: KILLED at 16.1M — reverting to 1-20 mix + seed_range increase
+
+---
+
+## Experiment 32: "1-20 Stage Mix + seed_range=10000 + 35M Steps" (RUNNING)
+- **Date**: 2026-05-02  |  Warm-start: Exp30 best_eval.pt (s1_best=12.3)
+- **Problem**: s1_best=12.3 but avg=8.7 — large gap indicates partial map memorisation.
+  With seed_range=1000, agent has seen each map multiple times and partially memorises
+  map-specific patterns rather than learning universal driving skills.
+- **Two changes**:
+  1. seed_range: 1000 → 10000 — 10x more unique maps, agent must truly generalise
+     Expected: avg rises, best-avg gap narrows significantly
+  2. total_timesteps: 25M → 35M — Exp30 was still improving at 25M end
+- **Stage mix**: same proven 1-20 distribution as Exp30 (expanding to 1-25 caused regression)
+- **learning_rate**: 1.5e-5 → 8e-6 (very mature policy now)
+- **Final results** (50M steps, completed):
+  - s1_best=**12.6** (all-time record)  |  rolling_avg=**8.76**
+  - seed_range=10000 confirmed — last 10 evals tighter (7.4–9.7 vs prior 6.2–11.5)
+  - Best-avg gap still ~4 stages — needs more training to consolidate
+- **Status**: COMPLETED
+
+---
+
+## Experiment 33: "100M Steps — Extended Consolidation" (RUNNING)
+- **Date**: 2026-05-03  |  Warm-start: Exp32 best_eval.pt (s1_best=12.6, avg=8.76)
+- **Hypothesis**: Rolling avg has been slowly climbing (8.62→8.76 over 50M steps).
+  100M total steps gives the policy time to fully consolidate the 10,000-seed
+  distribution and close the best-avg gap further.
+- **Changes from Exp32**:
+  - total_timesteps: 50M → 100M
+  - learning_rate: 5e-6 → 2e-6 (policy very mature, gentle updates)
+  - learning_rate_end: 5e-8 → 1e-8
+- **Everything else identical**: seed_range=10000, stage mix 1-20, max_objects=30
+- **Target**: s1_avg(last10) > 10.0, s1_best > 14.0
 - **Status**: RUNNING

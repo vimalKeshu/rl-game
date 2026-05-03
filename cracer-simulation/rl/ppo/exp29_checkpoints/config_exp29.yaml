@@ -1,27 +1,16 @@
-# PPO Training Configuration — Experiment 32
+# PPO Training Configuration — Experiment 29
 #
-# Warm-start: Exp30 best_eval.pt (s1_best=12.3, all-time record)
+# Warm-start: Exp28 best_eval.pt (s1_best=9.8, s1_avg=7.74)
 #
-# Two targeted changes to break the 12.3 ceiling:
-#
-# 1. seed_range: 1000 → 10000
-#    Agent was partially memorising 1000 maps. With 10000 maps each seen
-#    far fewer times, agent must learn universal driving skills rather than
-#    map-specific tricks. Expected: avg rises (more consistent), gap between
-#    best and avg narrows significantly.
-#
-# 2. total_timesteps: 25M → 35M (+40% more training)
-#    Exp30 was still improving at 25M end. More steps at the proven 1-20
-#    distribution consolidates the policy further.
-#
-# Stage mix: same as Exp30 (1-20) — proven best distribution.
-# Expanding to 1-25 (Exp31) caused regression — too diluted.
+# Same move as Exp20→Exp23: expand stage mix from 1-10 to 1-15.
+# Agent reaches stage 9-10 from cold start — needs direct practice
+# on stages 11-15 it's already reaching but hasn't trained on.
 
-total_timesteps: 100000000
+total_timesteps: 25000000
 max_episode_steps: 100000
 
-learning_rate: 0.000002
-learning_rate_end: 0.00000001
+learning_rate: 0.00002
+learning_rate_end: 0.0000003
 anneal_lr: true
 gamma: 0.99
 gae_lambda: 0.98
@@ -68,30 +57,25 @@ reward_safe_speed_bonus: 0.08
 reward_bonus_stage_scale: 0.3
 
 randomize_seed: true
-seed_range: 10000   # KEY CHANGE: was 1000, now 10000 — force true generalisation
+seed_range: 1000
 
-# Same proven 1-20 stage mix as Exp30
+# Expanded to stages 1-15
 stage_mix:
-  1:  0.20
-  2:  0.10
-  3:  0.08
-  4:  0.07
-  5:  0.07
-  6:  0.06
+  1:  0.25
+  2:  0.12
+  3:  0.10
+  4:  0.08
+  5:  0.08
+  6:  0.07
   7:  0.06
   8:  0.05
-  9:  0.05
-  10: 0.05
+  9:  0.04
+  10: 0.04
   11: 0.04
-  12: 0.04
-  13: 0.03
-  14: 0.03
-  15: 0.03
-  16: 0.02
-  17: 0.02
-  18: 0.02
-  19: 0.01
-  20: 0.01
+  12: 0.03
+  13: 0.02
+  14: 0.01
+  15: 0.01
 
 curriculum_enabled: false
 early_stopping_patience: 0

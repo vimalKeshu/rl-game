@@ -17,11 +17,11 @@
 # Stage mix: same as Exp30 (1-20) — proven best distribution.
 # Expanding to 1-25 (Exp31) caused regression — too diluted.
 
-total_timesteps: 100000000
+total_timesteps: 50000000
 max_episode_steps: 100000
 
-learning_rate: 0.000002
-learning_rate_end: 0.00000001
+learning_rate: 0.000005
+learning_rate_end: 0.00000005
 anneal_lr: true
 gamma: 0.99
 gae_lambda: 0.98
