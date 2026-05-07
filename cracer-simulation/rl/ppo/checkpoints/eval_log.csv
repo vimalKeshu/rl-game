@@ -1,2 +1,0 @@
-timestep,num_updates,episodes,stage1_mean_stage,stage1_mean_reward,stage1_mean_score,stage1_mean_length,stage5_mean_stage,stage5_mean_reward,stage5_mean_score,stage5_mean_length,stage10_mean_stage,stage10_mean_reward,stage10_mean_score,stage10_mean_length,overall_mean_stage,overall_mean_reward
-102400,25,19,9.3,157174.70257913283,80654.82428729741,8445.8,11.5,181597.67021373133,93561.69156733883,7313.5,12.1,73952.28833274182,38763.89669789137,2698.3,10.966666666666667,137574.88704186867

@@ -1,0 +1,113 @@
+# PPO Training Configuration — Experiment 32
+#
+# Warm-start: Exp30 best_eval.pt (s1_best=12.3, all-time record)
+#
+# Two targeted changes to break the 12.3 ceiling:
+#
+# 1. seed_range: 1000 → 10000
+#    Agent was partially memorising 1000 maps. With 10000 maps each seen
+#    far fewer times, agent must learn universal driving skills rather than
+#    map-specific tricks. Expected: avg rises (more consistent), gap between
+#    best and avg narrows significantly.
+#
+# 2. total_timesteps: 25M → 35M (+40% more training)
+#    Exp30 was still improving at 25M end. More steps at the proven 1-20
+#    distribution consolidates the policy further.
+#
+# Stage mix: same as Exp30 (1-20) — proven best distribution.
+# Expanding to 1-25 (Exp31) caused regression — too diluted.
+
+total_timesteps: 100000000
+max_episode_steps: 100000
+
+learning_rate: 0.000002
+learning_rate_end: 0.00000001
+anneal_lr: true
+gamma: 0.99
+gae_lambda: 0.98
+clip_epsilon: 0.2
+value_coef: 0.10
+entropy_coef: 0.001
+entropy_coef_end: 0.0001
+anneal_entropy: true
+max_grad_norm: 0.5
+normalize_returns: false
+
+rollout_steps: 4096
+num_epochs: 8
+batch_size: 64
+
+network_arch: mlp
+hidden_sizes:
+  - 512
+  - 512
+  - 512
+  - 256
+use_layer_norm: true
+shared_backbone: false
+
+normalize_obs: true
+obs_clip: 10.0
+frame_stack: 4
+max_objects: 30
+
+# Full proven reward stack
+reward_crash_penalty: 600.0
+reward_crash_penalty_stage_scale: 0.4
+reward_fuel_exhaustion_penalty: 600.0
+reward_low_fuel_penalty: 2.0
+reward_survival_bonus: 0.2
+reward_distance_scale: 0.2
+reward_stage_bonus: 500.0
+reward_speed_scale: 0.5
+reward_fuel_bonus: 45.0
+reward_pothole_penalty: 8.0
+reward_distance_milestone: 40.0
+reward_distance_milestone_interval: 300
+reward_safe_speed_bonus: 0.08
+reward_bonus_stage_scale: 0.3
+
+randomize_seed: true
+seed_range: 10000   # KEY CHANGE: was 1000, now 10000 — force true generalisation
+
+# Same proven 1-20 stage mix as Exp30
+stage_mix:
+  1:  0.20
+  2:  0.10
+  3:  0.08
+  4:  0.07
+  5:  0.07
+  6:  0.06
+  7:  0.06
+  8:  0.05
+  9:  0.05
+  10: 0.05
+  11: 0.04
+  12: 0.04
+  13: 0.03
+  14: 0.03
+  15: 0.03
+  16: 0.02
+  17: 0.02
+  18: 0.02
+  19: 0.01
+  20: 0.01
+
+curriculum_enabled: false
+early_stopping_patience: 0
+
+eval_interval_updates: 25
+eval_episodes: 10
+eval_start_stages:
+  - 1
+  - 5
+  - 10
+eval_deterministic: true
+eval_max_episode_steps: 100000
+
+log_interval: 1
+save_interval: 25
+checkpoint_dir: rl/ppo/checkpoints
+
+env_fps: 60
+device: cpu
